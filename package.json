@@ -40,8 +40,9 @@
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit",
     "selftest": "node scripts/selftest.mjs",
     "render": "node scripts/render-smoke.mjs",
+    "interaction": "node scripts/interaction-smoke.mjs",
     "integration": "node scripts/integration.mjs",
-    "check": "npm run build && npm run selftest && npm run render"
+    "check": "npm run build && npm run selftest && npm run render && npm run interaction"
   },
   "dsh": {
     "bundle": {
@@ -66,6 +67,7 @@
     "@deepseek-ai/dsh-client-ui-slots": "0.2.1-rc.2",
     "@types/node": "^22.20.0",
     "@types/react": "~18.3.31",
+    "jsdom": "^25.0.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "tsdown": "^0.15.12",
