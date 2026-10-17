@@ -64,12 +64,23 @@ dsh plugin --profile desktop add .
 
 ```bash
 npm run typecheck   # 宿主 + 客户端两套 tsconfig
-npm run selftest    # 11 组离线自测，不打上游
-npm run check       # build + selftest
-node scripts/live-smoke.mjs   # 可选：真打上游，会消耗免费额度
+npm run check       # build + 三组离线冒烟，全都不打上游
+npm run selftest    # 11 组：会话头、清单、分类、存储、路由、adapter、SSE、bundle
+npm run render      # 用真 React 渲染构建产物里那张卡，验首帧不崩
+npm run interaction # jsdom 里点一遍：勾选、单条测试、刷新、批量测试、失败路径
+node scripts/live-smoke.mjs                        # 可选，真打上游，会花额度
+node scripts/integration.mjs                       # 可选，要 FMO_HOST_MODULES
 ```
 
-`selftest` 里的假 fetch 覆盖了：会话头构造、清单合并、五档分类、超时、存储往返、四条桥接路由的守卫/方法/作用域、adapter 只暴露勾选集、SSE → harness chunk 转换、宿主 bundle 注册、客户端 bundle 过模块加载器。
+`integration.mjs` 把宿主真的 `LlmRuntime` 拉起来跑一遍注册与流式，能抓到离线用例抓不到的契约漂移。宿主把 `@deepseek-ai/*` 打进 `app.asar`，普通 node 进程 import 不了，所以要用解包出来的依赖树：
+
+```bash
+FMO_HOST_MODULES=/path/to/extracted/@deepseek-ai/tree node scripts/integration.mjs
+```
+
+没设这个变量就跳过，不算失败。
+
+`render` 和 `interaction` 需要 `react-dom`，`interaction` 还需要 `jsdom`。两者都是 devDependency，装了 `node_modules` 就有；缺了会跳过而不是失败。
 
 ## 它怎么实现的（给想改的人）
 

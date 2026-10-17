@@ -62,10 +62,23 @@ Verdicts stay in memory only. Rate limits expire — persisting "unavailable" to
 
 ```bash
 npm run typecheck   # host + client tsconfigs
-npm run selftest    # 11 offline suites, no upstream traffic
-npm run check       # build + selftest
-node scripts/live-smoke.mjs   # optional: hits the real lane, spends quota
+npm run check       # build + three offline smokes, none touch upstream
+npm run selftest    # 11 suites: ids, catalogue, classification, store, routes, adapter, SSE, bundles
+npm run render      # renders the built card with real React to prove first paint
+npm run interaction # drives the card in jsdom: tick, probe one, refresh, bulk, failure
+node scripts/live-smoke.mjs                        # optional, hits the real lane, spends quota
+node scripts/integration.mjs                       # optional, needs FMO_HOST_MODULES
 ```
+
+`integration.mjs` boots the host's real `LlmRuntime` and runs registration plus a streamed call through it — drift the offline suites cannot see. The harness ships `@deepseek-ai/*` inside `app.asar`, which a plain node process cannot import, so point it at an extracted tree:
+
+```bash
+FMO_HOST_MODULES=/path/to/extracted/@deepseek-ai/tree node scripts/integration.mjs
+```
+
+Unset, it skips instead of failing.
+
+`render` needs `react-dom`; `interaction` also needs `jsdom`. Both are devDependencies, and both steps skip rather than fail when they are missing.
 
 ## How it works
 
