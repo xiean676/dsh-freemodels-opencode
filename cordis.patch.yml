@@ -1,0 +1,8 @@
+# dsh-freemodels-opencode
+#
+# The host half registers the `opencode` provider itself, so this row only
+# needs the package resolved; the client half is declared through package.json's
+# `dsh.client` section and loaded by the GUI.
+- insert:
+    - id: dsh-freemodels-opencode
+      name: dsh-freemodels-opencode

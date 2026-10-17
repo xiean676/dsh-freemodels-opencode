@@ -1,0 +1,71 @@
+{
+  "name": "dsh-freemodels-opencode",
+  "displayName": "DSH Free Models · opencode",
+  "description": "把 opencode Zen 免费车道的模型接入 DeepSeek Harness：可刷新模型清单、勾选要用的模型、一键测试每个模型能不能用。零勾选时列表不显示任何模型。",
+  "version": "0.1.0",
+  "author": "xiean676",
+  "license": "MIT",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "opencode",
+    "zen",
+    "free-models",
+    "model-provider"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "README.en.md",
+    "THIRD_PARTY_NOTICES.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "build:node": "tsdown --config tsdown.config.ts",
+    "build:client": "tsdown --config tsdown.client.config.ts",
+    "prepack": "npm run build",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit",
+    "selftest": "node scripts/selftest.mjs",
+    "check": "npm run build && npm run selftest"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xiean676/dsh-freemodels-opencode.git"
+  },
+  "homepage": "https://github.com/xiean676/dsh-freemodels-opencode#readme",
+  "bugs": {
+    "url": "https://github.com/xiean676/dsh-freemodels-opencode/issues"
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh-client-ui-slots": "0.2.1-rc.2",
+    "@types/node": "^22.20.0",
+    "@types/react": "~18.3.31",
+    "react": "^18.3.1",
+    "tsdown": "^0.15.12",
+    "typescript": "^5.9.0"
+  }
+}
