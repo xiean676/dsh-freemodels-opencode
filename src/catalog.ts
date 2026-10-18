@@ -7,6 +7,11 @@
  *   2. `https://models.dev/api.json` — context window, output cap, vision and
  *      deprecation flags. Best effort: when it is unreachable the catalogue
  *      still works with defaults.
+ *
+ * Only free-lane models survive the merge. The gateway lists 85 ids, of which
+ * 76 are paid (claude-*, gpt-5*, gemini-3*, grok-*, kimi-*, qwen3-* …). Those
+ * are dropped here rather than hidden in the UI, so a priced id can never reach
+ * the picker, the probe queue, the state file or the harness catalogue.
  */
 import { disguiseHeaders, probeRequestIDs } from './zen-ids.ts'
 
@@ -166,8 +171,12 @@ export async function fetchModelsDev(fetchImpl: typeof fetch = fetch): Promise<M
   if (!response.ok) throw new Error(`models.dev answered HTTP ${response.status}`)
   return decodeModelsDev(await response.json())
 }
-/** Heuristic pre-filter only — the probe is the only authority on reachability. */
-function isFreeLane(id: string, dev: DevModel | undefined): boolean {
+/**
+ * Heuristic pre-filter only — the probe is the only authority on reachability.
+ * A model is kept when it is cheap by any measure: no blocklist hit, known free
+ * by observation, zero-priced in models.dev, or carrying a `free` marker.
+ */
+export function isFreeLane(id: string, dev: DevModel | undefined): boolean {
   if (FREE_LANE_BLOCKLIST.has(id)) return false
   if (STATIC_FREE_MODELS.has(id)) return true
   if (dev !== undefined) {
@@ -181,24 +190,29 @@ function positive(value: number | undefined): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined
 }
 
+/**
+ * Build the catalogue, dropping every model that is not on the free lane.
+ *
+ * The filter lives here, at the single point where ids become metadata, so the
+ * paid models never exist downstream: not in the state file, not in `/status`,
+ * not in the probe sweep, and not in what the harness is offered.
+ */
 export function mergeCatalog(ids: string[], dev: Map<string, DevModel>): ModelMeta[] {
   const models: ModelMeta[] = []
   for (const id of ids) {
     const entry = dev.get(id)
+    if (!isFreeLane(id, entry)) continue
     models.push({
       id,
       name: entry?.name ?? id,
-      freeLane: isFreeLane(id, entry),
+      freeLane: true,
       deprecated: entry?.deprecated === true,
       contextWindow: positive(entry?.contextWindow) ?? DEFAULT_CONTEXT_WINDOW,
       maxTokens: positive(entry?.maxOutput) ?? DEFAULT_MAX_TOKENS,
       image: entry?.image === true,
     })
   }
-  return models.sort((a, b) => {
-    if (a.freeLane !== b.freeLane) return a.freeLane ? -1 : 1
-    return a.id.localeCompare(b.id)
-  })
+  return models.sort((a, b) => a.id.localeCompare(b.id))
 }
 
 export interface RefreshResult {

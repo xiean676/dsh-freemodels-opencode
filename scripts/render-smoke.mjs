@@ -43,7 +43,7 @@ globalThis.fetch = async (url, init) => {
       value: {
         models: [
           { id: 'big-pickle', name: 'big-pickle', freeLane: true, deprecated: false, image: false, contextWindow: 262144, maxTokens: 32768 },
-          { id: 'claude-opus-5', name: 'Claude Opus 5', freeLane: false, deprecated: false, image: true, contextWindow: 200000, maxTokens: 32000 },
+          { id: 'mimo-v2.6-flash-free', name: 'MiMo', freeLane: true, deprecated: false, image: true, contextWindow: 1048576, maxTokens: 131072 },
         ],
         selected: ['big-pickle'],
         lastRefresh: '2026-10-17T17:00:00.000Z',

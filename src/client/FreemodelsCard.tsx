@@ -108,8 +108,6 @@ const CSS = `
 .fmo-label{display:flex;align-items:center;gap:8px;flex:1 1 auto;min-width:0;cursor:pointer;}
 .fmo-id{font-family:var(--ds-font-family-code,ui-monospace,monospace);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .fmo-badge{font-size:10px;padding:0 5px;border-radius:999px;border:1px solid currentColor;opacity:.85;flex:0 0 auto;}
-.fmo-free{color:var(--dsw-alias-state-success-primary,#4caf50);}
-.fmo-paid{color:var(--dsw-alias-label-tertiary,#999);}
 .fmo-dim{color:var(--dsw-alias-label-dimmed,#777);}
 .fmo-verdict{flex:0 0 auto;font-size:11px;padding:0 6px;border-radius:999px;border:1px solid currentColor;}
 .fmo-v-available{color:var(--dsw-alias-state-success-primary,#4caf50);}
@@ -264,7 +262,7 @@ export function FreemodelsCard(): JSX.Element {
     }
   }, [status?.selected])
 
-  const rank = (model: ModelRow): number => (selected.has(model.id) ? 0 : model.freeLane ? 1 : 2)
+  const rank = (model: ModelRow): number => (selected.has(model.id) ? 0 : 1)
   const sorted = [...models].sort((a, b) => rank(a) - rank(b) || a.id.localeCompare(b.id))
   const idle = busy === 'idle'
 
@@ -273,7 +271,7 @@ export function FreemodelsCard(): JSX.Element {
       <div className="fmo-head">
         <div className="fmo-title">opencode 免费模型</div>
         <span className="fmo-sub">
-          {models.length} 个模型 · 已勾选 {selected.size} 个 · 上次刷新 {stamp(status?.lastRefresh ?? '')}
+          {models.length} 个免费模型 · 已勾选 {selected.size} 个 · 上次刷新 {stamp(status?.lastRefresh ?? '')}
         </span>
       </div>
 
@@ -298,7 +296,7 @@ export function FreemodelsCard(): JSX.Element {
       <div className="fmo-list">
         {sorted.length === 0 ? (
           <div className="fmo-empty">
-            {status === undefined ? '正在读取…' : '还没有模型清单。点「刷新模型」从 opencode Zen 拉取。'}
+            {status === undefined ? '正在读取…' : '还没有模型清单。点「刷新模型」拉取 opencode Zen 的免费模型。'}
           </div>
         ) : (
           sorted.map((model) => {
@@ -314,9 +312,6 @@ export function FreemodelsCard(): JSX.Element {
                   />
                   <span className="fmo-id" title={model.id}>
                     {model.name === model.id ? model.id : `${model.name} · ${model.id}`}
-                  </span>
-                  <span className={`fmo-badge ${model.freeLane ? 'fmo-free' : 'fmo-paid'}`}>
-                    {model.freeLane ? '免费车道' : '可能需付费'}
                   </span>
                   {model.deprecated ? <span className="fmo-badge fmo-dim">已弃用</span> : null}
                 </label>

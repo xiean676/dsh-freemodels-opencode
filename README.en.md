@@ -12,13 +12,11 @@ This is an independent project. It does **not** modify or depend on [`@opencode2
 
 ## Why
 
-`https://opencode.ai/zen/v1/models` currently returns **85 model ids**, but:
+`https://opencode.ai/zen/v1/models` currently returns 85 model ids, 76 of them paid. This plugin **drops the paid ones at fetch time** and keeps only the ~9 free-lane models, so no paid id ever reaches the card, the probe queue, or the state file.
 
-- only 9 carry a `-free` suffix, while suffix-less ids like `big-pickle` are on the free lane too;
-- the lane flips constantly — rate limits, geo-blocks, upstream policy changes. The same model that returned 200 an hour ago returns 429 now;
-- paid models answer anonymous traffic with 401 `AuthError`, which *looks* like breakage but means "this costs money".
+"Free lane" is not just the `-free` suffix: `big-pickle` has no suffix yet sits on the lane, and a few suffixed ids are blocklisted.
 
-So "does it work" can only be a **live observation**. That is what this plugin does.
+What a static list still cannot answer: the lane flips constantly — rate limits, geo-blocks, upstream policy changes. The same model that returned 200 an hour ago returns 429 now. So "does it work" can only be a **live observation**. That is what this plugin does.
 
 ## Install
 
@@ -40,10 +38,12 @@ Restart Harness, open **Settings → Models**, and scroll to the bottom.
 
 ## Using it
 
-1. **刷新模型 / Refresh** — pull the list (also happens automatically on first load).
-2. Tick the models you want. Free-lane models sort first; the rest are marked "可能需付费".
+1. **刷新模型 / Refresh** — pull the list (also happens automatically on first load). Only free models are listed.
+2. Tick what you want. Only ticked models reach the model picker.
 3. **测试** on a row — one real minimal request, verdict in a few hundred milliseconds.
 4. **测试已勾选（N）** — probes the ticked set serially, and stops at the first `paid` verdict because every later probe would fail identically.
+
+> Free-lane detection is a heuristic (blocklist → known-good list → zero price on models.dev → `free` in the id). If a newly launched free model is missing, or a paid one slipped in, press **刷新模型** to re-decide; the rule lives in `isFreeLane` in `src/catalog.ts`.
 
 ### Verdicts
 
@@ -85,7 +85,7 @@ Unset, it skips instead of failing.
 | File | Role |
 | --- | --- |
 | `src/zen-ids.ts` | The `ses_*` session id and seven disguise headers the free lane demands |
-| `src/catalog.ts` | Zen model list + models.dev metadata merged into `ModelMeta[]` |
+| `src/catalog.ts` | Zen model list + models.dev metadata; **paid models dropped** before the merge into `ModelMeta[]` |
 | `src/probe.ts` | Single-model probe and the verdict classifier (never throws) |
 | `src/store.ts` | `$DSH_HOME/data/dsh-freemodels-opencode/state.json`, serial, atomic replace |
 | `src/adapter.ts` | The `LlmAdapter` for provider `opencode`; advertises only the ticked set |

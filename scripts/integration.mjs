@@ -71,7 +71,7 @@ try {
   await store.replaceCatalog(
     [
       { id: 'big-pickle', name: 'big-pickle', freeLane: true, deprecated: false, image: false, contextWindow: 262_144, maxTokens: 32_768 },
-      { id: 'claude-opus-5', name: 'claude-opus-5', freeLane: false, deprecated: false, image: true, contextWindow: 200_000, maxTokens: 32_000 },
+      { id: 'mimo-v2.6-flash-free', name: 'MiMo', freeLane: true, deprecated: false, image: true, contextWindow: 200_000, maxTokens: 32_000 },
     ],
     new Date().toISOString(),
   )
@@ -159,11 +159,10 @@ try {
   }
   console.log(`  ok  runtime.stream assembled ${chunks.length} chunks (${kinds.join(' → ')})`)
 
-  // A model the adapter does not advertise must still route: core routing
-  // accepts unlisted ids, only GUI entry points need membership.
+  // Only ticked models are advertised: the second free-lane model stays out.
   const unknown = runtime.listModels('opencode')
   const settled = await unknown
-  if (settled.some((entry) => entry.id === 'claude-opus-5')) {
+  if (settled.some((entry) => entry.id === 'mimo-v2.6-flash-free')) {
     throw new Error('an unticked model leaked into the catalogue')
   }
   console.log('  ok  an unticked model never appears in the catalogue')

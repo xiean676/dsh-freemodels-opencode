@@ -59,6 +59,10 @@ export function decodeState(raw: unknown): StoreState {
   for (const entry of Array.isArray(record.models) ? record.models : []) {
     const model = decodeModel(entry)
     if (model === undefined || known.has(model.id)) continue
+    // 0.1.0 stored the whole gateway list, paid models included. Anything the
+    // old version explicitly marked as not free is stale by definition, so it is
+    // dropped on load instead of waiting for the next refresh.
+    if (!model.freeLane) continue
     known.add(model.id)
     models.push(model)
   }
@@ -79,12 +83,28 @@ export function decodeState(raw: unknown): StoreState {
 }
 
 export async function loadState(dataDir: string): Promise<StoreState> {
+  return (await readState(dataDir)).state
+}
+
+/**
+ * Read the state, reporting whether decoding dropped anything.
+ *
+ * Dropping means the file predates the free-lane filter (0.1.0 stored all 85
+ * gateway ids). The caller rewrites the file once so the paid ids do not keep
+ * sitting on disk pretending to be pickable.
+ */
+async function readState(dataDir: string): Promise<{ state: StoreState; pruned: boolean }> {
   try {
     const text = await readFile(statePath(dataDir), 'utf8')
-    return decodeState(JSON.parse(text) as unknown)
+    const raw = JSON.parse(text) as unknown
+    const state = decodeState(raw)
+    const record = asRecord(raw)
+    const storedModels = Array.isArray(record?.models) ? record.models.length : 0
+    const storedSelected = Array.isArray(record?.selected) ? record.selected.length : 0
+    return { state, pruned: storedModels !== state.models.length || storedSelected !== state.selected.length }
   } catch {
     // Missing or unreadable state is the first-run case, not an error.
-    return { ...EMPTY_STATE }
+    return { state: { ...EMPTY_STATE }, pruned: false }
   }
 }
 
@@ -121,8 +141,12 @@ export class ModelStore {
   }
 
   async load(): Promise<void> {
-    this.#state = await loadState(this.#dataDir)
+    const { state, pruned } = await readState(this.#dataDir)
+    this.#state = state
     this.#loaded = true
+    // A file written before the free-lane filter is rewritten once, so the paid
+    // ids stop occupying the picker (and the probe queue) after an upgrade.
+    if (pruned) await save(this.#dataDir, this.#state)
   }
 
   /** Serialized read-modify-write; concurrent callers cannot lose an update. */

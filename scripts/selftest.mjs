@@ -12,7 +12,7 @@
  *      slot.
  */
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -110,7 +110,7 @@ await step('free-lane identity: canonical session header, seven disguise headers
   assert.notEqual(ids.canonicalSessionID('a'), ids.canonicalSessionID('b'))
 })
 
-await step('catalogue: free-lane detection, metadata merge, ordering', async () => {
+await step('catalogue: only free-lane models survive the merge', async () => {
   const { mergeCatalog, decodeModelsDev, DEFAULT_CONTEXT_WINDOW } = await import(here('src/catalog.ts'))
   const dev = decodeModelsDev({
     opencode: {
@@ -129,17 +129,29 @@ await step('catalogue: free-lane detection, metadata merge, ordering', async () 
 
   const models = mergeCatalog(['gpt-5.5', 'big-pickle', 'unknown-model', 'gone-free', 'vision-free'], dev)
   const byId = new Map(models.map((model) => [model.id, model]))
-  assert.equal(byId.get('big-pickle').freeLane, true, 'zero-price model is free lane')
+  assert.deepEqual(
+    models.map((model) => model.id),
+    ['big-pickle', 'vision-free'],
+    'priced, deprecated and unmarked ids are dropped; the rest sort by id',
+  )
+  assert.equal(byId.has('gpt-5.5'), false, 'a priced model never enters the catalogue')
   assert.equal(byId.get('big-pickle').contextWindow, 200000)
   assert.equal(byId.get('big-pickle').maxTokens, 8192)
-  assert.equal(byId.get('gpt-5.5').freeLane, false, 'priced model is not free lane')
-  assert.equal(byId.get('gone-free').freeLane, false, 'deprecated model never counts as free')
   assert.equal(byId.get('vision-free').image, true)
-  assert.equal(byId.get('unknown-model').contextWindow, DEFAULT_CONTEXT_WINDOW, 'unknown id gets defaults')
-  assert.equal(models[0].freeLane, true, 'free-lane models sort first')
+  assert.ok(models.every((model) => model.freeLane), 'everything left is on the free lane')
+  assert.equal(
+    mergeCatalog(['mystery-model'], new Map()).length,
+    0,
+    'an id with no free marker and no metadata is not advertised',
+  )
+  assert.equal(
+    mergeCatalog(['mystery-free'], new Map())[0]?.contextWindow,
+    DEFAULT_CONTEXT_WINDOW,
+    'a free-marked id with no metadata gets defaults',
+  )
 })
 
-await step('probe classification matches the five measured upstream shapes', async () => {
+await step('probe classification matches the measured upstream shapes', async () => {
   const { classify } = await import(here('src/probe.ts'))
   const cases = [
     [200, 'data: {"choices":[{"delta":{"content":"pong"}}]}', 'available'],
@@ -202,6 +214,29 @@ await step('store: round-trip, tick order, nothing ticked → nothing advertised
     assert.deepEqual(reloaded.advertised().map((model) => model.id), ['b', 'a'], 'selection survives a restart')
     assert.equal(reloaded.state.lastRefresh, '2026-10-18T00:00:00.000Z')
 
+    // A 0.1.0 state file listed the whole gateway, paid models included. Loading
+    // it must drop those and rewrite the file instead of leaving them on disk.
+    await writeFile(
+      join(dir, 'dsh-freemodels-opencode', 'state.json'),
+      JSON.stringify({
+        version: 1,
+        selected: ['a', 'claude-opus-5'],
+        models: [
+          ...models,
+          { id: 'claude-opus-5', name: 'Opus', freeLane: false, deprecated: false, contextWindow: 1, maxTokens: 1, image: true },
+        ],
+        lastRefresh: '2026-10-18T00:00:00.000Z',
+        lastError: '',
+      }),
+      'utf8',
+    )
+    const upgraded = new ModelStore(dir)
+    await upgraded.load()
+    assert.deepEqual(upgraded.state.models.map((model) => model.id), ['a', 'b'], 'paid ids are dropped on load')
+    assert.deepEqual(upgraded.state.selected, ['a'], 'a paid tick is dropped with its model')
+    const rewritten = JSON.parse(await readFile(join(dir, 'dsh-freemodels-opencode', 'state.json'), 'utf8'))
+    assert.deepEqual(rewritten.models.map((model) => model.id), ['a', 'b'], 'the pruned catalogue is written back')
+
     await reloaded.replaceCatalog([models[0]], '2026-10-18T01:00:00.000Z')
     assert.deepEqual(reloaded.advertised().map((model) => model.id), ['a'], 'vanished models are un-ticked')
 
@@ -219,10 +254,12 @@ await step('bridge: guard, methods, refresh, select, probe scopes', async () => 
     const { makeRoutes } = await import(here('src/bridge.ts'))
     const store = new ModelStore(dir)
     await store.load()
+    // `m-looks-free` passes the free-lane filter but the lane still answers 401:
+    // that is what the `paid` verdict is for, and it must stop a sweep.
     await store.replaceCatalog(
       [
-        { id: 'm-good', name: 'Good', freeLane: true, deprecated: false, contextWindow: 1000, maxTokens: 100, image: false },
-        { id: 'm-paid', name: 'Paid', freeLane: false, deprecated: false, contextWindow: 1000, maxTokens: 100, image: false },
+        { id: 'm-good-free', name: 'Good', freeLane: true, deprecated: false, contextWindow: 1000, maxTokens: 100, image: false },
+        { id: 'm-looks-free', name: 'Looks Free', freeLane: true, deprecated: false, contextWindow: 1000, maxTokens: 100, image: false },
       ],
       '2026-10-18T00:00:00.000Z',
     )
@@ -235,9 +272,9 @@ await step('bridge: guard, methods, refresh, select, probe scopes', async () => 
       const body = init.body === undefined ? {} : JSON.parse(init.body)
       probes.push(body.model)
       if (url.endsWith('/v1/models')) {
-        return { body: JSON.stringify({ object: 'list', data: [{ id: 'm-good' }, { id: 'm-paid' }] }) }
+        return { body: JSON.stringify({ object: 'list', data: [{ id: 'm-good-free' }, { id: 'm-looks-free' }] }) }
       }
-      if (body.model === 'm-paid') {
+      if (body.model === 'm-looks-free') {
         return { status: 401, body: '{"type":"error","error":{"type":"AuthError","message":"Missing API key."}}' }
       }
       return { body: sseBody() }
@@ -278,11 +315,11 @@ await step('bridge: guard, methods, refresh, select, probe scopes', async () => 
     assert.equal(bad.json.ok, false)
     assert.equal(bad.json.code, 'settings-rejected')
 
-    const selected = await call(at('select'), { method: 'POST', body: { selected: ['m-paid', 'm-good', 'ghost'] } })
-    assert.deepEqual(selected.json.value.selected, ['m-paid', 'm-good'], 'unknown ids are dropped')
-    assert.deepEqual(store.advertised().map((model) => model.id), ['m-paid', 'm-good'])
+    const selected = await call(at('select'), { method: 'POST', body: { selected: ['m-looks-free', 'm-good-free', 'ghost'] } })
+    assert.deepEqual(selected.json.value.selected, ['m-looks-free', 'm-good-free'], 'unknown ids are dropped')
+    assert.deepEqual(store.advertised().map((model) => model.id), ['m-looks-free', 'm-good-free'])
 
-    const one = await call(at('probe'), { method: 'POST', body: { scope: 'one', id: 'm-good' } })
+    const one = await call(at('probe'), { method: 'POST', body: { scope: 'one', id: 'm-good-free' } })
     assert.equal(one.json.value.results[0].verdict, 'available')
 
     // A sweep stops at the first auth refusal: every later probe would fail the
@@ -291,10 +328,10 @@ await step('bridge: guard, methods, refresh, select, probe scopes', async () => 
     const sweep = await call(at('probe'), { method: 'POST', body: { scope: 'selected' } })
     assert.deepEqual(
       sweep.json.value.results.map((result) => [result.id, result.verdict]),
-      [['m-paid', 'paid']],
+      [['m-looks-free', 'paid']],
       'the sweep stopped after the paid verdict',
     )
-    assert.deepEqual(probes, ['m-paid'], 'only one upstream call was spent')
+    assert.deepEqual(probes, ['m-looks-free'], 'only one upstream call was spent')
 
     const badScope = await call(at('probe'), { method: 'POST', body: { scope: 'nope' } })
     assert.equal(badScope.json.ok, false)
@@ -547,3 +584,4 @@ if (failures.length > 0) {
 } else {
   console.log(`${passed} passed`)
 }
+
