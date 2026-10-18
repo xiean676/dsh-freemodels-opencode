@@ -91,17 +91,35 @@ function summary(models: ModelMeta[]): Array<Record<string, unknown>> {
     image: model.image,
     contextWindow: model.contextWindow,
     maxTokens: model.maxTokens,
+    reasoning: model.reasoning,
+    effortValues: model.effortValues,
   }))
 }
 
-/** Serial on purpose: a burst of parallel probes manufactures the very rate limits it reports. */
+/**
+ * A `retry-after` longer than this cannot be per-model: the lane meters one
+ * shared bucket per egress, so every remaining probe would answer identically
+ * and only burn the window the user is waiting out.
+ */
+const SHARED_WINDOW_MS = 5 * 60 * 1000
+
+/**
+ * Serial on purpose: a burst of parallel probes manufactures the very rate
+ * limits it reports.
+ *
+ * The run stops on the first verdict that cannot vary by model:
+ * `paid` (the lane has no credential for this model class), `exhausted` (the
+ * lane refused this client outright) and `rate_limited` with a long
+ * `retry-after` (one shared bucket is spent). Everything else keeps probing —
+ * a short 429 is genuinely per-model information worth collecting.
+ */
 async function sweep(deps: BridgeDeps, ids: string[], timeoutMs?: number): Promise<ProbeResult[]> {
   const results: ProbeResult[] = []
   for (const id of ids) {
     const result = await probeModel(id, { fetchImpl: deps.fetchImpl, baseUrl: deps.baseUrl, timeoutMs })
     results.push(result)
-    // An auth refusal means every later probe fails identically: stop paying.
-    if (result.verdict === 'paid') break
+    if (result.verdict === 'paid' || result.verdict === 'exhausted') break
+    if (result.verdict === 'rate_limited' && (result.retryAfterMs ?? 0) > SHARED_WINDOW_MS) break
   }
   return results
 }
@@ -161,7 +179,10 @@ export function makeHandlers(deps: BridgeDeps) {
       if (typeof body.id !== 'string' || body.id === '') {
         return { ok: false, code: 'settings-rejected', message: "scope 'one' requires an id" }
       }
-      return { ok: true, value: { results: [await probeModel(body.id, { ...deps, timeoutMs })] } }
+      return {
+        ok: true,
+        value: { results: [await probeModel(body.id, { fetchImpl: deps.fetchImpl, baseUrl: deps.baseUrl, timeoutMs })] },
+      }
     }
     if (scope === 'selected') {
       const ids = store.state.selected

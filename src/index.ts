@@ -81,12 +81,14 @@ export function apply(ctx: unknown, config: PluginConfig = {}): void {
   handle = registerAdapter.call(host.llm, [PROVIDER_ID], adapter)
   log(ctx, 'info', `dsh-freemodels-opencode: provider "${PROVIDER_ID}" registered`)
 
-  // First run has no cached catalogue: fetch one so the card is not empty.
+  // First run has no cached catalogue: fetch one so the card is not empty. An
+  // upgraded install has one, but possibly missing effort levels, so it is
+  // refreshed once too instead of advertising incomplete models.
   void (async () => {
     try {
-      await store.load()
+      const { stale } = await store.load()
       publish()
-      if (store.state.models.length === 0) {
+      if (store.state.models.length === 0 || stale) {
         const result = await refreshCatalog({ baseUrl })
         await store.replaceCatalog(result.models, result.fetchedAt)
         publish()

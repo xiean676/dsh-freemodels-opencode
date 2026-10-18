@@ -10,6 +10,12 @@ import { DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS, type ModelMeta } from './ca
 
 export interface StoreState {
   version: 1
+  /**
+   * Shape revision of the cached catalogue. Bumped when a new field has to be
+   * collected from upstream; a file below {@link CATALOG_VERSION} is refreshed
+   * once on load so effort levels are not silently missing after an upgrade.
+   */
+  catalogVersion: number
   /** Tick order is the order models are advertised to the harness. */
   selected: string[]
   models: ModelMeta[]
@@ -17,8 +23,12 @@ export interface StoreState {
   lastError: string
 }
 
+/** Current catalogue shape: 2 adds `reasoning` / `effortValues` per model. */
+export const CATALOG_VERSION = 2
+
 export const EMPTY_STATE: StoreState = {
   version: 1,
+  catalogVersion: CATALOG_VERSION,
   selected: [],
   models: [],
   lastRefresh: '',
@@ -47,7 +57,18 @@ function decodeModel(raw: unknown): ModelMeta | undefined {
     contextWindow: positive(record?.contextWindow, DEFAULT_CONTEXT_WINDOW),
     maxTokens: positive(record?.maxTokens, DEFAULT_MAX_TOKENS),
     image: record?.image === true,
+    reasoning: record?.reasoning === true,
+    effortValues: decodeEfforts(record?.effortValues),
   }
+}
+
+function decodeEfforts(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return []
+  const out: string[] = []
+  for (const entry of raw) {
+    if (typeof entry === 'string' && entry !== '' && !out.includes(entry)) out.push(entry)
+  }
+  return out
 }
 
 export function decodeState(raw: unknown): StoreState {
@@ -75,11 +96,16 @@ export function decodeState(raw: unknown): StoreState {
 
   return {
     version: 1,
+    catalogVersion: positive0(record.catalogVersion),
     selected,
     models,
     lastRefresh: typeof record.lastRefresh === 'string' ? record.lastRefresh : '',
     lastError: typeof record.lastError === 'string' ? record.lastError : '',
   }
+}
+
+function positive0(value: unknown): number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 0
 }
 
 export async function loadState(dataDir: string): Promise<StoreState> {
@@ -92,8 +118,12 @@ export async function loadState(dataDir: string): Promise<StoreState> {
  * Dropping means the file predates the free-lane filter (0.1.0 stored all 85
  * gateway ids). The caller rewrites the file once so the paid ids do not keep
  * sitting on disk pretending to be pickable.
+ *
+ * `stale` means the cached catalogue is missing fields this build needs (effort
+ * levels arrived in catalogue shape 2). The caller refreshes once so upgraded
+ * installs do not advertise models with silently missing reasoning levels.
  */
-async function readState(dataDir: string): Promise<{ state: StoreState; pruned: boolean }> {
+async function readState(dataDir: string): Promise<{ state: StoreState; pruned: boolean; stale: boolean }> {
   try {
     const text = await readFile(statePath(dataDir), 'utf8')
     const raw = JSON.parse(text) as unknown
@@ -101,10 +131,14 @@ async function readState(dataDir: string): Promise<{ state: StoreState; pruned: 
     const record = asRecord(raw)
     const storedModels = Array.isArray(record?.models) ? record.models.length : 0
     const storedSelected = Array.isArray(record?.selected) ? record.selected.length : 0
-    return { state, pruned: storedModels !== state.models.length || storedSelected !== state.selected.length }
+    return {
+      state,
+      pruned: storedModels !== state.models.length || storedSelected !== state.selected.length,
+      stale: storedModels > 0 && state.catalogVersion < CATALOG_VERSION,
+    }
   } catch {
     // Missing or unreadable state is the first-run case, not an error.
-    return { state: { ...EMPTY_STATE }, pruned: false }
+    return { state: { ...EMPTY_STATE }, pruned: false, stale: false }
   }
 }
 
@@ -140,13 +174,18 @@ export class ModelStore {
     return this.#loaded
   }
 
-  async load(): Promise<void> {
-    const { state, pruned } = await readState(this.#dataDir)
+  /**
+   * Load the cached state. Resolves to `stale: true` when the caller should
+   * refresh the catalogue once (missing fields from an older build).
+   */
+  async load(): Promise<{ stale: boolean }> {
+    const { state, pruned, stale } = await readState(this.#dataDir)
     this.#state = state
     this.#loaded = true
     // A file written before the free-lane filter is rewritten once, so the paid
     // ids stop occupying the picker (and the probe queue) after an upgrade.
     if (pruned) await save(this.#dataDir, this.#state)
+    return { stale }
   }
 
   /** Serialized read-modify-write; concurrent callers cannot lose an update. */
@@ -161,8 +200,14 @@ export class ModelStore {
   }
 
   #advertised(): string {
+    // Effort levels are part of the published catalogue: a model that gains or
+    // loses a level must republish, otherwise the picker keeps offering levels
+    // dsh-llm would now reject.
     return this.#selectedModels()
-      .map((model) => `${model.id}|${model.contextWindow}|${model.maxTokens}|${model.image}`)
+      .map(
+        (model) =>
+          `${model.id}|${model.contextWindow}|${model.maxTokens}|${model.image}|${model.reasoning}|${(model.effortValues ?? []).join('+')}`,
+      )
       .join(',')
   }
 
@@ -182,6 +227,7 @@ export class ModelStore {
       const known = new Set(models.map((model) => model.id))
       return {
         ...state,
+        catalogVersion: CATALOG_VERSION,
         models,
         selected: state.selected.filter((id) => known.has(id)),
         lastRefresh,

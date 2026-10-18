@@ -22,15 +22,17 @@ console.log('live smoke: refreshing the catalogue from opencode.ai …')
 const started = Date.now()
 const catalog = await refreshCatalog()
 console.log(
-  `  ${catalog.models.length} models in ${Date.now() - started} ms` +
-    ` (${catalog.models.filter((model) => model.freeLane).length} free lane,` +
-    ` metadata ${catalog.enriched ? 'enriched' : 'unavailable'})`,
+  `  ${catalog.models.length} free models in ${Date.now() - started} ms` +
+    ` (metadata ${catalog.enriched ? 'enriched' : 'unavailable'})`,
 )
 if (catalog.warning !== undefined) console.log(`  warning: ${catalog.warning}`)
+for (const model of catalog.models) {
+  const effort = model.reasoning ? (model.effortValues.length === 0 ? 'default ladder' : model.effortValues.join('/')) : '—'
+  console.log(`  efforts ${effort.padEnd(34)} ${model.id}`)
+}
 
-const free = catalog.models.filter((model) => model.freeLane).slice(0, 4)
-const paid = catalog.models.find((model) => !model.freeLane)
-const candidates = [...free.map((model) => model.id), ...(paid === undefined ? [] : [paid.id])]
+const free = catalog.models.slice(0, 4)
+const candidates = free.map((model) => model.id)
 
 console.log(`live smoke: probing ${candidates.join(', ')} …`)
 const verdicts = new Map()

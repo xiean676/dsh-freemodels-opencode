@@ -12,6 +12,7 @@
  * plugin's internals — see THIRD_PARTY_NOTICES.md.
  */
 import { DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS, ZEN_BASE_URL, type ModelMeta } from './catalog.ts'
+import { parseRetryAfter } from './probe.ts'
 import { disguiseHeaders, deriveRequestIDs, type RequestIDs } from './zen-ids.ts'
 import type { ModelStore } from './store.ts'
 
@@ -20,6 +21,54 @@ export const PROVIDER_NAME = 'opencode'
 
 const ANONYMOUS_KEY = 'public'
 const DEFAULT_TIMEOUT_MS = 120_000
+
+/**
+ * The effort ladder the harness understands, lowest first. Anything outside it
+ * is dropped rather than forwarded: the Zen gateway hard-400s unknown values.
+ */
+export const REASONING_EFFORT_LADDER = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
+
+/**
+ * Ladder used when models.dev says the model reasons but names no levels
+ * (`reasoning_options: []` or a bare `{"type":"toggle"}`). It stays inside what
+ * the free lane is known to accept.
+ */
+const DEFAULT_EFFORT_LADDER: readonly string[] = ['off', 'minimal', 'low', 'medium', 'high']
+
+/**
+ * Turn a model's declared capability into harness effort entries.
+ *
+ * Two spellings differ between models.dev and the wire: models.dev writes
+ * `none` where the harness layer uses `off`, and the gateway only accepts
+ * `none` for "stop thinking" (omitting the field means "provider default"),
+ * so the translation happens both ways — see {@link reasoningEffortWire}.
+ */
+export function reasoningEfforts(meta: ModelMeta | undefined): { id: string; name: string }[] | undefined {
+  if (meta?.reasoning !== true) return undefined
+  const declared: string[] = []
+  for (const value of meta.effortValues) {
+    const level = value === 'none' ? 'off' : value
+    if ((REASONING_EFFORT_LADDER as readonly string[]).includes(level) && !declared.includes(level)) {
+      declared.push(level)
+    }
+  }
+  const ladder = declared.length === 0 ? [...DEFAULT_EFFORT_LADDER] : declared
+  const ordered = ladder
+    .slice()
+    .sort(
+      (a, b) =>
+        (REASONING_EFFORT_LADDER as readonly string[]).indexOf(a) -
+        (REASONING_EFFORT_LADDER as readonly string[]).indexOf(b),
+    )
+  return ordered.map((level) => ({ id: level, name: level[0]?.toUpperCase() + level.slice(1) }))
+}
+
+/** Harness spelling → wire spelling. `off` must be sent as `none`. */
+export function reasoningEffortWire(effort: string | undefined): string | undefined {
+  if (effort === undefined) return undefined
+  if (effort === 'off') return 'none'
+  return (REASONING_EFFORT_LADDER as readonly string[]).includes(effort) ? effort : undefined
+}
 
 /* ------------------------------------------------------------------ types */
 
@@ -224,7 +273,28 @@ function parseEvent(raw: string): SSEEvent {
   return { event, data: data.join('\n') }
 }
 
-function failureOf(status: number, text: string): { message: string; code: string } {
+interface Failure {
+  message: string
+  code: string
+  providerRetryAfterMs?: number
+}
+
+/**
+ * Local mirror of the host's resolved retry policy. `@deepseek-ai/dsh-llm` is
+ * type-only here (it ships inside app.asar), so the shape is restated rather
+ * than imported — `resolveRetryPolicy` validates the same fields at
+ * registration and throws if this drifts.
+ */
+interface RetryPolicy {
+  mode: 'normal'
+  maxRetries: number
+  retryableCodes: string[]
+  initialDelayMs: number
+  maxDelayMs: number
+  jitterRatio: number
+}
+
+function failureOf(status: number, text: string, retryAfterMs?: number): Failure {
   const trimmed = text.trim()
   let message = trimmed === '' ? `HTTP ${status}` : trimmed
   let code = 'UPSTREAM'
@@ -236,14 +306,36 @@ function failureOf(status: number, text: string): { message: string; code: strin
     // Non-JSON body: keep the raw text.
   }
   if (lower.includes('freeusagelimiterror') || /\b429\b|rate.?limit/.test(lower)) code = 'RATE_LIMIT'
+  // The lane has two distinct refusals and they need different advice:
+  //   429 FreeUsageLimitError  — a window that passes on its own;
+  //   403 FreeTierError        — the client fingerprint is refused outright,
+  //                              so retrying and switching models are wasted.
+  // The probe distinguishes them as rate_limited vs exhausted; the live path
+  // must not flatten both into AUTH, which reads like a broken key.
+  if (lower.includes('freetiererror') || lower.includes('free tier can only be used')) code = 'LANE_EXHAUSTED'
   // Checked before AUTH: a geo-block is also a 403, but switching keys or
   // retrying will not help — the egress country is what is refused.
-  if (lower.includes('regionerror') || lower.includes('not available in your country')) code = 'REGION_BLOCKED'
+  else if (lower.includes('regionerror') || lower.includes('not available in your country')) code = 'REGION_BLOCKED'
   else if (lower.includes('autherror') || status === 401 || status === 403) code = 'AUTH'
   if (lower.includes('model is unavailable') || lower.includes('model_not_found') || status === 404) code = 'MODEL_UNAVAILABLE'
   if (status >= 500) code = 'SERVER'
   if (message.length > 400) message = `${message.slice(0, 400)}…`
-  return { message: `opencode: ${message}`, code }
+  // The retry policy drops RATE_LIMIT (see providerRetryPolicy), so this text is
+  // what the user actually reads. Say when the window opens instead of leaving
+  // "try again later" as the only advice.
+  if (retryAfterMs !== undefined && Number.isFinite(retryAfterMs) && retryAfterMs > 0) {
+    const seconds = Math.ceil(retryAfterMs / 1000)
+    const wait =
+      seconds < 90 ? `${seconds} 秒` : seconds < 5400 ? `${Math.ceil(seconds / 60)} 分钟` : `${Math.ceil(seconds / 3600)} 小时`
+    message = `${message}（上游建议 ${wait}后再试）`
+  }
+  return {
+    message: `opencode: ${message}`,
+    code,
+    ...(retryAfterMs !== undefined && Number.isFinite(retryAfterMs) && retryAfterMs > 0
+      ? { providerRetryAfterMs: retryAfterMs }
+      : {}),
+  }
 }
 
 /* -------------------------------------------------------------- adapter */
@@ -263,10 +355,21 @@ export class OpenCodeAdapter {
     return { id: provider, name: PROVIDER_NAME }
   }
 
-  providerRetryPolicy(): undefined {
-    // The lane 429s in bursts that outlast the host default; retrying inside a
-    // single turn multiplies the cost of a limit the user can see and re-run.
-    return undefined
+  providerRetryPolicy(): RetryPolicy {
+    // The harness default (5 retries over ~15s) is wrong for this lane in both
+    // directions. A 429 carries a window measured in minutes to hours, so an
+    // in-turn retry just re-spends the same refusal and buries it under four
+    // more attempts — the probe exists so the user can see the verdict and
+    // re-run deliberately. A 403 FreeTierError is terminal for the fingerprint
+    // and must never be retried. Genuinely transient faults still get one shot.
+    return {
+      mode: 'normal',
+      maxRetries: 1,
+      retryableCodes: ['EMPTY_RESPONSE', 'TIMEOUT', 'TRANSPORT'],
+      initialDelayMs: 800,
+      maxDelayMs: 5_000,
+      jitterRatio: 0.1,
+    }
   }
 
   async listModels(provider: string): Promise<LlmModelInfo[]> {
@@ -282,6 +385,7 @@ export class OpenCodeAdapter {
 
   async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
     const meta = this.#meta(model)
+    const efforts = reasoningEfforts(meta)
     return {
       provider,
       id: model,
@@ -289,6 +393,10 @@ export class OpenCodeAdapter {
       inputModalities: ['text'],
       context: { contextWindow: meta?.contextWindow ?? DEFAULT_CONTEXT_WINDOW },
       defaultMaxTokens: meta?.maxTokens ?? DEFAULT_MAX_TOKENS,
+      // Advertising levels is what makes them selectable; dsh-llm rejects a
+      // requested effort outright (`UNSUPPORTED_REASONING_EFFORT`) when this is
+      // absent, so a model that thinks but declares nothing must still answer.
+      ...(efforts === undefined ? {} : { reasoning: { efforts } }),
     }
   }
 
@@ -297,8 +405,19 @@ export class OpenCodeAdapter {
     return { model: resolved, stream: (options: GenerateOptions) => this.stream(options) }
   }
 
+  /**
+   * Metadata for one model id.
+   *
+   * Ticked models win, but the whole cached catalogue is consulted too: the
+   * harness documents that core routing accepts unlisted ids, so a session that
+   * names a known-but-unticked model must still get its real limits and effort
+   * levels instead of the generic defaults.
+   */
   #meta(model: string): ModelMeta | undefined {
-    return this.#store.advertised().find((entry) => entry.id === model)
+    const advertised = this.#store.advertised()
+    const ticked = advertised.find((entry) => entry.id === model)
+    if (ticked !== undefined) return ticked
+    return this.#store.state.models.find((entry) => entry.id === model)
   }
 
   /** Chat-completions payload for one turn, gates applied. */
@@ -318,6 +437,10 @@ export class OpenCodeAdapter {
       body.tool_choice = 'auto'
     }
     if (typeof options.temperature === 'number') body.temperature = options.temperature
+    // Only sent when the caller picked a level. Omitting the field keeps the
+    // provider default, which is what an untouched selector should mean.
+    const wireEffort = reasoningEffortWire(options.reasoningEffort)
+    if (wireEffort !== undefined) body.reasoning_effort = wireEffort
     const maxTokens = options.maxTokens ?? meta?.maxTokens ?? DEFAULT_MAX_TOKENS
     body.max_tokens = maxTokens
     return ensureFreeLaneShape(body)
@@ -346,7 +469,8 @@ export class OpenCodeAdapter {
       })
       if (!response.ok || response.body === null) {
         const text = await response.text().catch(() => '')
-        throw Object.assign(new Error(failureOf(response.status, text).message), failureOf(response.status, text))
+        const retryAfterMs = parseRetryAfter(response.headers.get('retry-after'))
+        throw Object.assign(new Error(failureOf(response.status, text, retryAfterMs).message), failureOf(response.status, text, retryAfterMs))
       }
       const decoder = new TextDecoder()
       const reader = response.body.getReader()
@@ -509,7 +633,8 @@ export class OpenCodeAdapter {
     } catch (error) {
       if (finished) return
       const aborted = options.signal?.aborted === true
-      const failure = error as { message?: string; code?: string }
+      const failure = error as Partial<Failure>
+      const retryAfterMs = failure?.providerRetryAfterMs
       yield {
         type: 'finish',
         reason: {
@@ -517,6 +642,9 @@ export class OpenCodeAdapter {
           failure: {
             message: typeof failure?.message === 'string' ? failure.message : String(error),
             code: aborted ? 'ABORTED' : typeof failure?.code === 'string' ? failure.code : 'UPSTREAM',
+            ...(typeof retryAfterMs === 'number' && Number.isFinite(retryAfterMs) && retryAfterMs > 0
+              ? { providerRetryAfterMs: retryAfterMs }
+              : {}),
           },
         },
       }

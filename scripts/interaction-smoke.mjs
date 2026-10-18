@@ -60,8 +60,28 @@ bundle.apply({
 /* A scriptable bridge: every route answers from `state`, and records calls. */
 const state = {
   models: [
-    { id: 'big-pickle', name: 'Big Pickle', freeLane: true, deprecated: false, image: false, contextWindow: 262144, maxTokens: 32768 },
-    { id: 'mimo-v2.6-flash-free', name: 'MiMo', freeLane: true, deprecated: false, image: true, contextWindow: 1048576, maxTokens: 131072 },
+    {
+      id: 'big-pickle',
+      name: 'Big Pickle',
+      freeLane: true,
+      deprecated: false,
+      image: false,
+      contextWindow: 262144,
+      maxTokens: 32768,
+      reasoning: true,
+      effortValues: ['none', 'low', 'high'],
+    },
+    {
+      id: 'mimo-v2.6-flash-free',
+      name: 'MiMo',
+      freeLane: true,
+      deprecated: false,
+      image: true,
+      contextWindow: 1048576,
+      maxTokens: 131072,
+      reasoning: false,
+      effortValues: [],
+    },
   ],
   selected: [],
   lastRefresh: '2026-10-17T17:00:00.000Z',
@@ -70,6 +90,7 @@ const state = {
 }
 const calls = []
 let failNext = false
+let exhaustNext = false
 globalThis.fetch = async (url, init) => {
   const path = String(url)
   const method = init?.method ?? 'GET'
@@ -92,7 +113,14 @@ globalThis.fetch = async (url, init) => {
   }
   if (path.endsWith('/probe')) {
     if (body.scope === 'one') {
-      return reply({ results: [{ id: body.id, verdict: 'rate_limited', detail: 'Rate limit exceeded.', ms: 900 }] })
+      return reply({
+        results: [{ id: body.id, verdict: 'rate_limited', detail: 'Rate limit exceeded.', ms: 900, retryAfterMs: 42000 }],
+      })
+    }
+    if (exhaustNext) {
+      // The host stops a sweep on a verdict that cannot vary by model, so the
+      // answer is a partial list — the card must say why, not just show a count.
+      return reply({ results: [{ id: state.selected[0], verdict: 'exhausted', detail: 'free tier refused', ms: 400 }] })
     }
     return reply({ results: state.selected.map((id) => ({ id, verdict: 'available', detail: 'upstream answered', ms: 1200 })) })
   }
@@ -150,7 +178,20 @@ if (probeCall?.body?.scope !== 'one' || probeCall.body.id !== 'big-pickle') {
   throw new Error(`probing one sent ${JSON.stringify(probeCall?.body)}`)
 }
 if (!text().includes('被限流')) throw new Error('the verdict never reached the row')
-console.log('  ok  one model probes and its verdict shows up')
+// The upstream said how long to wait; the row must relay it, not just the label.
+if (!text().includes('秒后可再试')) throw new Error(`retry-after never reached the row: ${text().slice(0, 400)}`)
+console.log('  ok  one model probes; its verdict and retry window show up')
+
+/* ------------------------------------------------- a sweep that ends early */
+exhaustNext = true
+await act(async () => {
+  button('测试已勾选').click()
+})
+await flush()
+exhaustNext = false
+if (!text().includes('车道额度用尽')) throw new Error('the exhausted verdict never rendered')
+if (!text().includes('就停了')) throw new Error(`a truncated sweep was not explained: ${text().slice(0, 400)}`)
+console.log('  ok  a sweep cut short by the lane explains itself')
 
 /* ------------------------------------------------------------ refresh + bulk */
 const refreshButton = button('刷新模型')

@@ -10,7 +10,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 const PREFIX = '/plugins/dsh-freemodels-opencode'
 
-type ProbeVerdict = 'available' | 'paid' | 'unavailable' | 'region' | 'rate_limited' | 'unknown'
+type ProbeVerdict =
+  | 'available'
+  | 'paid'
+  | 'unavailable'
+  | 'region'
+  | 'rate_limited'
+  | 'exhausted'
+  | 'unknown'
 
 interface ModelRow {
   id: string
@@ -20,6 +27,8 @@ interface ModelRow {
   image: boolean
   contextWindow: number
   maxTokens: number
+  reasoning: boolean
+  effortValues: string[]
 }
 
 interface ProbeResult {
@@ -27,6 +36,7 @@ interface ProbeResult {
   verdict: ProbeVerdict
   detail: string
   ms?: number
+  retryAfterMs?: number
 }
 
 interface StatusValue {
@@ -43,16 +53,28 @@ const VERDICT_LABEL: Record<ProbeVerdict, string> = {
   unavailable: '上游不提供',
   region: '区域受限',
   rate_limited: '被限流',
+  exhausted: '车道额度用尽',
   unknown: '未测出',
 }
 
 const VERDICT_TITLE: Record<ProbeVerdict, string> = {
-  available: '上游正常应答，现在就能用',
+  available: '刚才那次真实请求被正常应答，可以发消息',
   paid: '免费车道没有这个模型的凭据，需要 API key 或更高档位',
   unavailable: '上游不认识这个模型 id',
   region: '模型存在，但你当前网络所在的国家/地区被上游拒绝',
-  rate_limited: '当前被限流，稍后重测可能就通了',
+  rate_limited: '临时限流，等一会儿重测多半就通了',
+  exhausted: '免费车道拒绝了这台机器的客户端指纹，换模型也一样 —— 要等上游放开，不是等几分钟',
   unknown: '超时、5xx 或空响应 —— 没有结论，不代表不可用',
+}
+
+/** Turn `retryAfterMs` into the shortest honest phrasing. */
+function waitText(ms: number | undefined): string | undefined {
+  if (ms === undefined || ms <= 0) return undefined
+  const seconds = Math.round(ms / 1000)
+  if (seconds < 90) return `约 ${seconds} 秒后可再试`
+  const minutes = Math.round(seconds / 60)
+  if (minutes < 90) return `约 ${minutes} 分钟后可再试`
+  return `约 ${Math.round(minutes / 60)} 小时后可再试`
 }
 
 async function post<T>(path: string, body: unknown): Promise<T> {
@@ -115,6 +137,7 @@ const CSS = `
 .fmo-v-unavailable{color:var(--dsw-alias-state-error-primary,#ff6b6b);}
 .fmo-v-region{color:var(--dsw-alias-state-error-primary,#ff6b6b);}
 .fmo-v-rate_limited{color:var(--dsw-alias-state-warn-label,#e0a030);}
+.fmo-v-exhausted{color:var(--dsw-alias-state-error-primary,#ff6b6b);}
 .fmo-v-unknown{color:var(--dsw-alias-label-tertiary,#999);}
 .fmo-empty{padding:18px 12px;text-align:center;font-size:12px;color:var(--dsw-alias-label-tertiary,#888);}
 `
@@ -250,7 +273,16 @@ export function FreemodelsCard(): JSX.Element {
       for (const result of value.results) next[result.id] = result
       setVerdicts(next)
       const usable = value.results.filter((result) => result.verdict === 'available').length
-      setNote(`测试完成：${usable}/${value.results.length} 个可用`)
+      const blocked = value.results.find(
+        (result) => result.verdict === 'paid' || result.verdict === 'exhausted',
+      )
+      // The host stops the sweep on a verdict that cannot vary by model, so a
+      // short result list is expected — say why instead of showing a wrong total.
+      setNote(
+        blocked === undefined
+          ? `测试完成：${usable}/${value.results.length} 个可用`
+          : `测试到「${VERDICT_LABEL[blocked.verdict]}」就停了（后 ${ids.length - value.results.length} 个不会再变），已测 ${value.results.length} 个，${usable} 个可用`,
+      )
     } catch (cause) {
       if (!mounted.current) return
       setError(`测试失败：${cause instanceof Error ? cause.message : String(cause)}`)
@@ -314,6 +346,18 @@ export function FreemodelsCard(): JSX.Element {
                     {model.name === model.id ? model.id : `${model.name} · ${model.id}`}
                   </span>
                   {model.deprecated ? <span className="fmo-badge fmo-dim">已弃用</span> : null}
+                  {model.reasoning ? (
+                    <span
+                      className="fmo-badge fmo-dim"
+                      title={
+                        (model.effortValues ?? []).length === 0
+                          ? '上游没有声明档位，插件按 off/minimal/low/medium/high 提供'
+                          : `上游声明的档位：${(model.effortValues ?? []).join(' / ')}`
+                      }
+                    >
+                      可分档
+                    </span>
+                  ) : null}
                 </label>
                 {verdict === undefined ? null : (
                   <span
@@ -321,6 +365,7 @@ export function FreemodelsCard(): JSX.Element {
                     title={`${verdict.detail}${verdict.ms === undefined ? '' : ` · ${verdict.ms}ms`}`}
                   >
                     {VERDICT_LABEL[verdict.verdict]}
+                    {waitText(verdict.retryAfterMs) === undefined ? '' : ` · ${waitText(verdict.retryAfterMs)}`}
                   </span>
                 )}
                 <button
@@ -343,12 +388,16 @@ export function FreemodelsCard(): JSX.Element {
       </div>
 
       <div className="fmo-note">
-        {(['available', 'rate_limited', 'paid', 'region', 'unavailable', 'unknown'] as ProbeVerdict[]).map((verdict) => (
+        {(
+          ['available', 'rate_limited', 'exhausted', 'paid', 'region', 'unavailable', 'unknown'] as ProbeVerdict[]
+        ).map((verdict) => (
           <span key={verdict} className={`fmo-verdict fmo-v-${verdict}`} title={VERDICT_TITLE[verdict]} style={{ marginRight: 6 }}>
             {VERDICT_LABEL[verdict]}
           </span>
         ))}
-        <span>「被限流」「未测出」都不等于不可用，隔一会儿重测即可。</span>
+        <span>
+          「被限流」是一时之隔，等一会儿重测即可；「车道额度用尽」是这台机器的额度被上游按客户端指纹掐了，换模型也不会好。
+        </span>
       </div>
     </div>
   )

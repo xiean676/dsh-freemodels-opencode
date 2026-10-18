@@ -48,6 +48,10 @@ export interface ModelMeta {
   maxTokens: number
   /** Metadata declares image input. */
   image: boolean
+  /** Metadata declares the model thinks, so the harness may offer effort levels. */
+  reasoning: boolean
+  /** Effort spellings the gateway accepts for this model, as declared upstream. */
+  effortValues: string[]
 }
 
 interface DevModel {
@@ -58,6 +62,8 @@ interface DevModel {
   contextWindow?: number
   maxOutput?: number
   image: boolean
+  reasoning: boolean
+  effortValues: string[]
 }
 
 function withTimeout(): AbortSignal {
@@ -123,6 +129,32 @@ function hasImageInput(raw: Record<string, unknown>): boolean {
   return input.some((entry) => typeof entry === 'string' && entry.toLowerCase() === 'image')
 }
 
+/**
+ * Effort spells declared by models.dev.
+ *
+ * Only `{"type":"effort","values":[…]}` entries carry a ladder. A `toggle` entry
+ * (longcat-2.5-preview-free) or an empty `reasoning_options` array (big-pickle,
+ * mimo, nemotron-lightning) declares "this model thinks" without naming levels —
+ * those get the harness default ladder instead, and `[]` means exactly that.
+ */
+function decodeEffortValues(raw: Record<string, unknown>): string[] {
+  const options = raw.reasoning_options
+  if (!Array.isArray(options)) return []
+  const values: string[] = []
+  for (const option of options) {
+    const entry = asRecord(option)
+    if (entry?.type !== 'effort') continue
+    const list = entry.values
+    if (!Array.isArray(list)) continue
+    for (const value of list) {
+      if (typeof value !== 'string' || value.trim() === '') continue
+      const level = value.trim()
+      if (!values.includes(level)) values.push(level)
+    }
+  }
+  return values
+}
+
 /** Decode the opencode providers inside models.dev into a flat id → metadata map. */
 export function decodeModelsDev(data: unknown): Map<string, DevModel> {
   const out = new Map<string, DevModel>()
@@ -157,6 +189,11 @@ export function decodeModelsDev(data: unknown): Map<string, DevModel> {
         contextWindow: numeric(limit?.context),
         maxOutput: numeric(limit?.output),
         image: hasImageInput(raw),
+        // Reasoning metadata drives the harness's effort picker: without it the
+        // model is offered with no levels at all, which is why the "fill in the
+        // ladder" button in dsh-thinking-slider cannot help this provider.
+        reasoning: raw.reasoning === true,
+        effortValues: decodeEffortValues(raw),
       })
     }
   }
@@ -210,6 +247,8 @@ export function mergeCatalog(ids: string[], dev: Map<string, DevModel>): ModelMe
       contextWindow: positive(entry?.contextWindow) ?? DEFAULT_CONTEXT_WINDOW,
       maxTokens: positive(entry?.maxOutput) ?? DEFAULT_MAX_TOKENS,
       image: entry?.image === true,
+      reasoning: entry?.reasoning === true,
+      effortValues: entry?.effortValues ?? [],
     })
   }
   return models.sort((a, b) => a.id.localeCompare(b.id))

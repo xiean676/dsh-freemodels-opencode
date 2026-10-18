@@ -151,8 +151,40 @@ await step('catalogue: only free-lane models survive the merge', async () => {
   )
 })
 
+await step('catalogue: reasoning effort levels come from models.dev', async () => {
+  const { mergeCatalog, decodeModelsDev } = await import(here('src/catalog.ts'))
+  const dev = decodeModelsDev({
+    opencode: {
+      models: {
+        // Declared ladder, with models.dev's `none` spelling.
+        'ladder-free': {
+          cost: { input: 0, output: 0 },
+          reasoning: true,
+          reasoning_options: [{ type: 'effort', values: ['none', 'low', 'high'] }],
+        },
+        // Reasons, but declares no levels (empty array).
+        'levels-free': { cost: { input: 0, output: 0 }, reasoning: true, reasoning_options: [] },
+        // Reasons with only a toggle: no levels either.
+        'toggle-free': { cost: { input: 0, output: 0 }, reasoning: true, reasoning_options: [{ type: 'toggle' }] },
+        // Does not reason at all.
+        'plain-free': { cost: { input: 0, output: 0 } },
+      },
+    },
+  })
+  const models = mergeCatalog(['ladder-free', 'levels-free', 'toggle-free', 'plain-free'], dev)
+  const byId = new Map(models.map((model) => [model.id, model]))
+  assert.deepEqual(byId.get('ladder-free').effortValues, ['none', 'low', 'high'], 'the ladder is kept verbatim')
+  assert.equal(byId.get('ladder-free').reasoning, true)
+  assert.deepEqual(byId.get('levels-free').effortValues, [])
+  assert.equal(byId.get('levels-free').reasoning, true, 'reasoning without levels still reasons')
+  assert.deepEqual(byId.get('toggle-free').effortValues, [], 'a toggle declares no effort ladder')
+  assert.equal(byId.get('plain-free').reasoning, false)
+  // Metadata that predates this field must not crash the decode.
+  assert.deepEqual(mergeCatalog(['plain-free'], new Map())[0].effortValues, [])
+})
+
 await step('probe classification matches the measured upstream shapes', async () => {
-  const { classify } = await import(here('src/probe.ts'))
+  const { classify, parseRetryAfter, probeBody, REALISTIC_MAX_TOKENS } = await import(here('src/probe.ts'))
   const cases = [
     [200, 'data: {"choices":[{"delta":{"content":"pong"}}]}', 'available'],
     [429, '{"type":"error","error":{"type":"FreeUsageLimitError","message":"Rate limit exceeded. Please try again later."}}', 'rate_limited'],
@@ -163,12 +195,46 @@ await step('probe classification matches the measured upstream shapes', async ()
     [403, '{"type":"error","error":{"type":"RegionError","message":"This model is not available in your country"}}', 'region'],
     // Served, but not over the chat-completions protocol this lane speaks.
     [400, '{"type":"error","error":{"type":"ModelProtocolUnsupported","message":"Model does not support this protocol."}}', 'unavailable'],
+    // The lane refusing our client fingerprint. Waiting out a rate window does
+    // not fix it and buying a key is not what it asks for, so it is its own
+    // verdict — training the user to "retry in a minute" would be a lie.
+    [
+      403,
+      '{"type":"error","error":{"type":"FreeTierError","message":"OpenCode\'s free tier can only be used from within OpenCode. Download it at https://opencode.ai and keep building."}}',
+      'exhausted',
+    ],
     [503, '{"error":"bad gateway"}', 'unknown'],
     [200, '', 'unknown'],
   ]
   for (const [status, body, expected] of cases) {
     assert.equal(classify(status, body).verdict, expected, `HTTP ${status} → ${expected}`)
   }
+
+  // The probe must ask for a real answer, not a single token: a nearly-spent
+  // window happily answers `ping` and then 429s the user's first real turn.
+  const body = JSON.parse(probeBody('big-pickle'))
+  assert.equal(body.max_tokens, REALISTIC_MAX_TOKENS)
+  assert.ok(REALISTIC_MAX_TOKENS >= 256, 'a probe must request enough output to be representative')
+
+  assert.equal(parseRetryAfter('5'), 5000)
+  assert.equal(parseRetryAfter('74585'), 74_585_000)
+  assert.equal(parseRetryAfter(null), undefined)
+  assert.equal(parseRetryAfter(''), undefined)
+  assert.equal(parseRetryAfter('not a date'), undefined)
+  assert.equal(parseRetryAfter(new Date(20_000).toUTCString(), 10_000), 10_000, 'HTTP-date form')
+})
+
+await step('probe surfaces retry-after so "被限流" can say when to retry', async () => {
+  const { probeModel } = await import(here('src/probe.ts'))
+  const rateLimited = await probeModel('big-pickle', {
+    fetchImpl: fakeFetch(() => ({
+      status: 429,
+      headers: { 'content-type': 'application/json', 'retry-after': '42' },
+      body: '{"type":"error","error":{"type":"FreeUsageLimitError","message":"Rate limit exceeded."}}',
+    })),
+  })
+  assert.equal(rateLimited.verdict, 'rate_limited')
+  assert.equal(rateLimited.retryAfterMs, 42_000)
 })
 
 await step('probe never throws and reports a timeout as unknown, not unavailable', async () => {
@@ -337,6 +403,46 @@ await step('bridge: guard, methods, refresh, select, probe scopes', async () => 
     assert.equal(badScope.json.ok, false)
     assert.match(badScope.json.message, /scope must be/u)
 
+    // `exhausted` is the other sweep-terminating verdict: the lane refused this
+    // client outright, so every remaining model would answer identically.
+    const exhaustedFetch = fakeFetch((url, init) => {
+      if (url.includes('models.dev')) return { body: '{}', headers: { 'content-type': 'application/json' } }
+      if (url.endsWith('/v1/models')) {
+        return { body: JSON.stringify({ object: 'list', data: [{ id: 'm-good-free' }, { id: 'm-looks-free' }] }) }
+      }
+      return {
+        status: 403,
+        body: JSON.stringify({
+          type: 'error',
+          error: {
+            type: 'FreeTierError',
+            message: "OpenCode's free tier can only be used from within OpenCode.",
+          },
+        }),
+      }
+    })
+    const exhaustedRoutes = new Map(
+      makeRoutes({ store, publish: () => {}, fetchImpl: exhaustedFetch }).map((route) => [route.path, route]),
+    )
+    const refusals = []
+    const countingFetch = fakeFetch(async (url, init) => {
+      if (!url.endsWith('/v1/models')) refusals.push(init.body === undefined ? '' : JSON.parse(init.body).model)
+      return exhaustedFetch(url, init)
+    })
+    for (const route of makeRoutes({ store, publish: () => {}, fetchImpl: countingFetch })) {
+      exhaustedRoutes.set(route.path, route)
+    }
+    const exhaustedSweep = await call(exhaustedRoutes.get('/plugins/dsh-freemodels-opencode/probe'), {
+      method: 'POST',
+      body: { scope: 'selected' },
+    })
+    assert.deepEqual(
+      exhaustedSweep.json.value.results.map((result) => [result.id, result.verdict]),
+      [['m-looks-free', 'exhausted']],
+      'the sweep stopped after the lane refused the client',
+    )
+    assert.deepEqual(refusals, ['m-looks-free'], 'only one upstream call was spent')
+
     // An empty body is fine (`{}`); only unparseable JSON is a 400.
     const empty = await call(at('probe'), { method: 'POST' })
     assert.equal(empty.status, 200)
@@ -373,6 +479,7 @@ await step('adapter: only ticked models are advertised, empty tick list advertis
     const resolved = await adapter.resolveModel('opencode', 'big-pickle')
     assert.equal(resolved.context.contextWindow, 4096)
     assert.equal(resolved.defaultMaxTokens, 512)
+    assert.equal(resolved.reasoning, undefined, 'a model that does not reason advertises no efforts')
 
     // The gate tools must be appended, and tool_choice muted when they were the only tools.
     const shaped = ensureFreeLaneShape({ tools: [] })
@@ -394,6 +501,98 @@ await step('adapter: only ticked models are advertised, empty tick list advertis
     assert.deepEqual(transcript[1].tool_calls[0].id, 'c1')
     assert.equal(transcript[2].role, 'tool', 'tool results become a real tool turn')
     assert.equal(transcript[2].tool_call_id, 'c1')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+await step('adapter: reasoning efforts are advertised and reach the wire', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'fmo-effort-'))
+  try {
+    const { ModelStore } = await import(here('src/store.ts'))
+    const { OpenCodeAdapter, reasoningEfforts, reasoningEffortWire } = await import(here('src/adapter.ts'))
+    const base = { freeLane: true, deprecated: false, image: false, contextWindow: 4096, maxTokens: 512 }
+    const store = new ModelStore(dir)
+    await store.load()
+    await store.replaceCatalog(
+      [
+        { ...base, id: 'ladder-free', name: 'Ladder', reasoning: true, effortValues: ['none', 'low', 'high'] },
+        { ...base, id: 'levels-free', name: 'Levels', reasoning: true, effortValues: [] },
+        { ...base, id: 'plain-free', name: 'Plain', reasoning: false, effortValues: [] },
+      ],
+      '',
+    )
+    const adapter = new OpenCodeAdapter(store, { baseUrl: 'https://example.test/zen' })
+
+    // models.dev spells "no thinking" as `none`; the harness spells it `off`.
+    const ladder = await adapter.resolveModel('opencode', 'ladder-free')
+    assert.deepEqual(ladder.reasoning?.efforts.map((entry) => entry.id), ['off', 'low', 'high'])
+    assert.deepEqual(ladder.reasoning?.efforts.map((entry) => entry.name), ['Off', 'Low', 'High'])
+
+    // No declared ladder: fall back to a default one rather than refusing to
+    // reason at all — otherwise picking a level hits UNSUPPORTED_REASONING_EFFORT.
+    const levels = await adapter.resolveModel('opencode', 'levels-free')
+    assert.deepEqual(levels.reasoning?.efforts.map((entry) => entry.id), [
+      'off',
+      'minimal',
+      'low',
+      'medium',
+      'high',
+    ])
+
+    const plain = await adapter.resolveModel('opencode', 'plain-free')
+    assert.equal(plain.reasoning, undefined, 'a non-reasoning model advertises nothing')
+
+    assert.equal(reasoningEffortWire('off'), 'none', 'off must travel as none')
+    assert.equal(reasoningEffortWire('high'), 'high')
+    assert.equal(reasoningEffortWire(undefined), undefined)
+    assert.equal(reasoningEffortWire('bogus'), undefined, 'an unknown level is never forwarded')
+    assert.equal(reasoningEfforts({ reasoning: false, effortValues: [] }), undefined)
+
+    // Wire check: the chosen level must actually appear in the request body.
+    await store.setSelected(['ladder-free'])
+    const sent = []
+    const caller = globalThis.fetch
+    globalThis.fetch = fakeFetch((_url, init) => {
+      sent.push(JSON.parse(init.body))
+      return { body: sseBody() }
+    })
+    try {
+      for await (const _chunk of adapter.stream({
+        provider: 'opencode',
+        model: 'ladder-free',
+        reasoningEffort: 'off',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      })) {
+        // drain
+      }
+      assert.equal(sent[0].reasoning_effort, 'none', 'off is sent as none')
+
+      for await (const _chunk of adapter.stream({
+        provider: 'opencode',
+        model: 'ladder-free',
+        reasoningEffort: 'high',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      })) {
+        // drain
+      }
+      assert.equal(sent[1].reasoning_effort, 'high')
+
+      for await (const _chunk of adapter.stream({
+        provider: 'opencode',
+        model: 'ladder-free',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      })) {
+        // drain
+      }
+      assert.equal(
+        'reasoning_effort' in sent[2],
+        false,
+        'an untouched selector leaves the provider default alone',
+      )
+    } finally {
+      globalThis.fetch = caller
+    }
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
@@ -458,6 +657,50 @@ await step('adapter stream: SSE → harness chunks, usage before finish', async 
       assert.equal(chunks.length, 1, 'a failed call yields only a finish chunk')
       assert.equal(chunks[0].reason.kind, 'error')
       assert.equal(chunks[0].reason.failure.code, 'RATE_LIMIT')
+    } finally {
+      globalThis.fetch = caller
+    }
+
+    // A lane refusal is not an auth failure: the fingerprint is refused, so
+    // switching models or retrying inside the turn cannot help. It must not be
+    // flattened into AUTH, which the UI renders as "API 密钥无效".
+    globalThis.fetch = fakeFetch(() => ({
+      status: 403,
+      body: '{"type":"error","error":{"type":"FreeTierError","message":"OpenCode\'s free tier can only be used from within OpenCode."}}',
+    }))
+    try {
+      const chunks = []
+      for await (const chunk of adapter.stream({
+        provider: 'opencode',
+        model: 'big-pickle',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'ping' }] }],
+      })) {
+        chunks.push(chunk)
+      }
+      assert.equal(chunks.length, 1)
+      assert.equal(chunks[0].reason.failure.code, 'LANE_EXHAUSTED')
+    } finally {
+      globalThis.fetch = caller
+    }
+
+    // retry-after must survive into the failure so a retry policy can honour
+    // the upstream window instead of guessing one.
+    globalThis.fetch = fakeFetch(() => ({
+      status: 429,
+      headers: { 'content-type': 'application/json', 'retry-after': '42' },
+      body: '{"type":"error","error":{"type":"FreeUsageLimitError","message":"Rate limit exceeded."}}',
+    }))
+    try {
+      const chunks = []
+      for await (const chunk of adapter.stream({
+        provider: 'opencode',
+        model: 'big-pickle',
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'ping' }] }],
+      })) {
+        chunks.push(chunk)
+      }
+      assert.equal(chunks[0].reason.failure.code, 'RATE_LIMIT')
+      assert.equal(chunks[0].reason.failure.providerRetryAfterMs, 42_000)
     } finally {
       globalThis.fetch = caller
     }

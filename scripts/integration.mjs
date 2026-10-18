@@ -70,8 +70,28 @@ try {
   await store.load()
   await store.replaceCatalog(
     [
-      { id: 'big-pickle', name: 'big-pickle', freeLane: true, deprecated: false, image: false, contextWindow: 262_144, maxTokens: 32_768 },
-      { id: 'mimo-v2.6-flash-free', name: 'MiMo', freeLane: true, deprecated: false, image: true, contextWindow: 200_000, maxTokens: 32_000 },
+      {
+        id: 'big-pickle',
+        name: 'big-pickle',
+        freeLane: true,
+        deprecated: false,
+        image: false,
+        contextWindow: 262_144,
+        maxTokens: 32_768,
+        reasoning: true,
+        effortValues: ['none', 'low', 'high'],
+      },
+      {
+        id: 'mimo-v2.6-flash-free',
+        name: 'MiMo',
+        freeLane: true,
+        deprecated: false,
+        image: true,
+        contextWindow: 200_000,
+        maxTokens: 32_000,
+        reasoning: false,
+        effortValues: [],
+      },
     ],
     new Date().toISOString(),
   )
@@ -111,7 +131,94 @@ try {
   if (!duplicate) throw new Error('the runtime allowed a second adapter for the same provider')
   console.log('  ok  runtime refuses a duplicate provider registration')
 
+  /* ------------------------------------------------------------ reasoning */
+  // The runtime is the strict judge of effort levels: `resolveCallConfig`
+  // rejects any level the adapter did not advertise on that exact model. This
+  // is what "配置里没有代理商 opencode" looked like before — a level the model
+  // selector could offer but the runtime refused.
+  const withEffort = await runtime.resolveCallConfig({
+    provider: 'opencode',
+    model: 'big-pickle',
+    reasoningEffort: 'low',
+    messages: [],
+  })
+  if (withEffort?.reasoningEffort !== 'low') {
+    throw new Error(`the runtime dropped the requested effort: ${JSON.stringify(withEffort?.reasoningEffort)}`)
+  }
+  console.log('  ok  the runtime accepts a declared reasoning level')
+
+  let undeclaredLevel = false
+  try {
+    await runtime.resolveCallConfig({
+      provider: 'opencode',
+      model: 'big-pickle',
+      reasoningEffort: 'minimal',
+      messages: [],
+    })
+  } catch (error) {
+    undeclaredLevel = error?.code === 'UNSUPPORTED_REASONING_EFFORT'
+  }
+  if (!undeclaredLevel) throw new Error('the runtime accepted a level the adapter never advertised')
+  console.log('  ok  the runtime rejects an unadvertised reasoning level')
+
+  await store.setSelected(['big-pickle', 'mimo-v2.6-flash-free'])
+  handle.replace(['opencode'])
+  let noReasoning = false
+  try {
+    await runtime.resolveCallConfig({
+      provider: 'opencode',
+      model: 'mimo-v2.6-flash-free',
+      reasoningEffort: 'high',
+      messages: [],
+    })
+  } catch (error) {
+    noReasoning = error?.code === 'UNSUPPORTED_REASONING_EFFORT'
+  }
+  if (!noReasoning) throw new Error('a non-reasoning model accepted an effort level')
+  console.log('  ok  a non-reasoning model refuses every effort level')
+
+  /* ------------------------------------------------------------ retry policy */
+  // The runtime captures `providerRetryPolicy()` verbatim — it does NOT validate
+  // it — and `dsh-llm-retry` then reads the *flattened* resolved shape
+  // (`policy.maxRetries`, `policy.maxDelayMs`, …). So a hand-declared policy can
+  // reach the retry extension point malformed without anyone noticing. Validate
+  // the equivalent *config* through the host's own validator and compare the
+  // flattened values it would resolve to.
+  const { resolveRetryPolicy } = await importHost('dsh-llm')
+  const declared = runtime.providerRetryPolicy('opencode')
+  if (declared === undefined) throw new Error('the adapter declared no retry policy')
+  if (declared.retryableCodes.includes('RATE_LIMIT')) {
+    throw new Error('a lane 429 must not be retried inside the turn')
+  }
+  if (declared.retryableCodes.includes('AUTH') || declared.retryableCodes.includes('LANE_EXHAUSTED')) {
+    throw new Error('a terminal refusal must not be retried')
+  }
+  const resolved = resolveRetryPolicy(
+    {
+      mode: declared.mode,
+      maxRetries: declared.maxRetries,
+      retryableCodes: [...declared.retryableCodes],
+      backoff: {
+        initialDelayMs: declared.initialDelayMs,
+        maxDelayMs: declared.maxDelayMs,
+        jitterRatio: declared.jitterRatio,
+      },
+    },
+    'fmo:opencode.retryPolicy',
+  )
+  for (const key of ['mode', 'maxRetries', 'initialDelayMs', 'maxDelayMs', 'jitterRatio']) {
+    if (resolved[key] !== declared[key]) {
+      throw new Error(`the host resolves ${key} to ${resolved[key]}, the adapter declares ${declared[key]}`)
+    }
+  }
+  if (resolved.retryableCodes.join(',') !== declared.retryableCodes.join(',')) {
+    throw new Error(`retryableCodes drifted: ${resolved.retryableCodes.join(',')}`)
+  }
+  console.log('  ok  the declared retry policy matches what the host resolves and never retries RATE_LIMIT')
+
   /* ------------------------------------------------------------- streaming */
+  await store.setSelected(['big-pickle'])
+  handle.replace(['opencode'])
   globalThis.fetch = async () => {
     const frames = [
       `data: ${JSON.stringify({ choices: [{ delta: { role: 'assistant' } }] })}\n\n`,
