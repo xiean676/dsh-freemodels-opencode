@@ -91,8 +91,14 @@ function summary(models: ModelMeta[]): Array<Record<string, unknown>> {
     image: model.image,
     contextWindow: model.contextWindow,
     maxTokens: model.maxTokens,
+    // Without this the card cannot tell 262144-the-datasheet from
+    // 262144-the-fallback-constant, and would print a made-up size.
+    limitsKnown: model.limitsKnown,
     reasoning: model.reasoning,
     effortValues: model.effortValues,
+    // The card needs the rating and the note to label the badge honestly, and
+    // both window numbers to print the context size it is asked for.
+    rank: model.rank,
   }))
 }
 
@@ -143,7 +149,13 @@ export function makeHandlers(deps: BridgeDeps) {
 
   async function refresh(): Promise<Record<string, unknown>> {
     try {
-      const result = await refreshCatalog({ fetchImpl: deps.fetchImpl, baseUrl: deps.baseUrl })
+      const result = await refreshCatalog({
+        fetchImpl: deps.fetchImpl,
+        baseUrl: deps.baseUrl,
+        // models.dev times out often; without this a failed fetch would wipe
+        // every reasoning ladder and context window in the cache.
+        previous: store.state.models,
+      })
       await store.replaceCatalog(result.models, result.fetchedAt)
       deps.publish()
       return {

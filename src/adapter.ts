@@ -29,11 +29,17 @@ const DEFAULT_TIMEOUT_MS = 120_000
 export const REASONING_EFFORT_LADDER = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
 
 /**
- * Ladder used when models.dev says the model reasons but names no levels
- * (`reasoning_options: []` or a bare `{"type":"toggle"}`). It stays inside what
- * the free lane is known to accept.
+ * The four levels to offer when models.dev says a model reasons but names no
+ * levels (`reasoning_options: []` or a bare `{"type":"toggle"}`).
+ *
+ * `none / low / high / max` are the spellings measured working on this lane —
+ * the same four dsh-thinking-slider documents for its "fill in four levels"
+ * action. That action cannot help here, because it edits the `llm-pi-ai`
+ * provider table and `opencode` is not in it: this adapter is its own provider,
+ * so the ladder has to come from here. The middle rung is left out on purpose;
+ * a level the gateway does not accept is a hard 400 on every turn.
  */
-const DEFAULT_EFFORT_LADDER: readonly string[] = ['off', 'minimal', 'low', 'medium', 'high']
+const DEFAULT_EFFORT_LADDER: readonly string[] = ['off', 'low', 'high', 'max']
 
 /**
  * Turn a model's declared capability into harness effort entries.
@@ -396,6 +402,8 @@ export class OpenCodeAdapter {
       // Advertising levels is what makes them selectable; dsh-llm rejects a
       // requested effort outright (`UNSUPPORTED_REASONING_EFFORT`) when this is
       // absent, so a model that thinks but declares nothing must still answer.
+      // A model that declares no levels at all gets the four measured working
+      // spellings rather than an empty ladder, which would read as "no thinking".
       ...(efforts === undefined ? {} : { reasoning: { efforts } }),
     }
   }

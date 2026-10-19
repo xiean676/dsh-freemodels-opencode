@@ -12,7 +12,7 @@
  *      slot.
  */
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -111,7 +111,7 @@ await step('free-lane identity: canonical session header, seven disguise headers
 })
 
 await step('catalogue: only free-lane models survive the merge', async () => {
-  const { mergeCatalog, decodeModelsDev, DEFAULT_CONTEXT_WINDOW } = await import(here('src/catalog.ts'))
+  const { mergeCatalog, decodeModelsDev, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS } = await import(here('src/catalog.ts'))
   const dev = decodeModelsDev({
     opencode: {
       models: {
@@ -137,6 +137,7 @@ await step('catalogue: only free-lane models survive the merge', async () => {
   assert.equal(byId.has('gpt-5.5'), false, 'a priced model never enters the catalogue')
   assert.equal(byId.get('big-pickle').contextWindow, 200000)
   assert.equal(byId.get('big-pickle').maxTokens, 8192)
+  assert.equal(byId.get('big-pickle').limitsKnown, true, 'a described model knows its window')
   assert.equal(byId.get('vision-free').image, true)
   assert.ok(models.every((model) => model.freeLane), 'everything left is on the free lane')
   assert.equal(
@@ -148,6 +149,19 @@ await step('catalogue: only free-lane models survive the merge', async () => {
     mergeCatalog(['mystery-free'], new Map())[0]?.contextWindow,
     DEFAULT_CONTEXT_WINDOW,
     'a free-marked id with no metadata gets defaults',
+  )
+  // ...but the defaults are flagged, so the card cannot print them as if
+  // models.dev had published them. This is the difference between showing
+  // "上下文 256K" for a model whose window nobody knows and showing nothing.
+  assert.equal(
+    mergeCatalog(['mystery-free'], new Map())[0]?.limitsKnown,
+    false,
+    'a defaulted window is marked unknown rather than presented as a fact',
+  )
+  assert.equal(
+    mergeCatalog(['mystery-free'], new Map())[0]?.maxTokens,
+    DEFAULT_MAX_TOKENS,
+    'and the output cap falls back the same way',
   )
 })
 
@@ -181,6 +195,196 @@ await step('catalogue: reasoning effort levels come from models.dev', async () =
   assert.equal(byId.get('plain-free').reasoning, false)
   // Metadata that predates this field must not crash the decode.
   assert.deepEqual(mergeCatalog(['plain-free'], new Map())[0].effortValues, [])
+})
+
+await step('rank: hand table, heuristic ceiling, total and stable capability order', async () => {
+  const { rankModel, compareByCapability, ratedModelIds, HEURISTIC_CEILING } = await import(here('src/rank.ts'))
+
+  // The table is the product: DSH's own model leads, and every entry says it is
+  // a judgement rather than a benchmark.
+  const top = rankModel({ id: 'space-bunny-free' })
+  assert.equal(top.source, 'table')
+  assert.equal(top.grade, 'S')
+  assert.ok(top.score >= 90, `S band starts at 90, got ${top.score}`)
+  assert.match(top.note, /人工评级/u)
+  assert.match(top.note, /不是跑分/u)
+
+  // Grade is derived from the score, never stored beside it.
+  const bands = [
+    ['space-bunny-free', 'S'],
+    ['deepseek-v4.1-flash-free', 'S'],
+    ['glm-5.3-flash-free', 'A'],
+    ['nemotron-3.5-super-vl-free', 'A'],
+    ['longcat-2.5-preview-free', 'B'],
+    ['big-pickle', 'B'],
+    ['nemotron-3.5-lightning-free', 'C'],
+    ['beam-free', 'C'],
+  ]
+  for (const [id, grade] of bands) {
+    const rank = rankModel({ id })
+    assert.equal(rank.grade, grade, `${id} should read ${grade}, read ${rank.grade}`)
+    assert.equal(rank.source, 'table', `${id} is rated by hand`)
+  }
+
+  // A tier word must not stack with itself, and must always land under the
+  // lowest hand rating so tomorrow's model cannot displace a written one.
+  const unknown = rankModel({ id: 'brand-new-preview-ultra-flash' })
+  assert.equal(unknown.source, 'heuristic')
+  assert.ok(unknown.score <= HEURISTIC_CEILING, `heuristic ${unknown.score} must respect the ceiling ${HEURISTIC_CEILING}`)
+  const lowestManual = Math.min(...ratedModelIds().map((id) => rankModel({ id }).score))
+  assert.ok(unknown.score < lowestManual, 'an unrated model sorts below every rated one')
+
+  // The version number nudges, and does not escape the ceiling.
+  assert.ok(rankModel({ id: 'gemini-v9.9-thing' }).score >= rankModel({ id: 'gemini-v1.0-thing' }).score)
+
+  // Order is total: no two distinct entries compare as equal, and reversing the
+  // input cannot change the answer — otherwise rows would swap between renders.
+  const rows = [
+    { id: 'big-pickle', contextWindow: 200000, effortValues: [] },
+    { id: 'space-bunny-free', contextWindow: 1048576, effortValues: ['low', 'high', 'max'] },
+    { id: 'mystery-x', contextWindow: 200000, effortValues: [] },
+    { id: 'mystery-y', contextWindow: 200000, effortValues: ['low'] },
+    { id: 'nemotron-3.5-lightning-free', contextWindow: 262144, effortValues: [] },
+  ]
+  const forward = [...rows].sort(compareByCapability).map((row) => row.id)
+  const backward = [...rows].reverse().sort(compareByCapability).map((row) => row.id)
+  assert.deepEqual(forward, backward, 'the order does not depend on input order')
+  assert.deepEqual(forward, [
+    'space-bunny-free',
+    'big-pickle',
+    'nemotron-3.5-lightning-free',
+    'mystery-y',
+    'mystery-x',
+  ], 'capability first, then context, then ladder depth, then id')
+  assert.equal(compareByCapability({ id: 'a' }, { id: 'a' }), 0, 'an entry equals itself')
+  assert.equal(compareByCapability({ id: 'a' }, { id: 'b' }) < 0, true, 'tied entries fall back to the id')
+})
+
+await step('rank: an older cached catalogue is refetched, never shown unranked', async () => {
+  const { CATALOG_VERSION } = await import(here('src/store.ts'))
+  const { mergeCatalog, decodeModelsDev, DEFAULT_CONTEXT_WINDOW } = await import(here('src/catalog.ts'))
+  assert.equal(CATALOG_VERSION, 4, 'catalogue shape 4 carries both a rank and knowing whether the limits are real')
+
+  const dir = await mkdtemp(join(tmpdir(), 'fmo-rank-version-'))
+  try {
+    const { ModelStore } = await import(here('src/store.ts'))
+    // Exactly the file 0.1.x left behind: effort levels, no rank, shape 2.
+    await mkdir(join(dir, 'dsh-freemodels-opencode'), { recursive: true })
+    await writeFile(
+      join(dir, 'dsh-freemodels-opencode', 'state.json'),
+      JSON.stringify({
+        version: 1,
+        catalogVersion: 2,
+        selected: ['space-bunny-free'],
+        models: [
+          {
+            id: 'space-bunny-free',
+            name: 'Space Bunny',
+            freeLane: true,
+            deprecated: false,
+            contextWindow: 1048576,
+            maxTokens: 524288,
+            image: true,
+            reasoning: true,
+            effortValues: ['low', 'medium', 'high', 'xhigh', 'max'],
+          },
+        ],
+        lastRefresh: '2026-10-18T00:00:00.000Z',
+        lastError: '',
+      }),
+      'utf8',
+    )
+    const store = new ModelStore(dir)
+    const load = await store.load()
+    assert.equal(load.stale, true, 'a shape-2 catalogue must trigger one refresh')
+    assert.equal(store.state.selected[0], 'space-bunny-free', 'the tick itself is not lost')
+    // Even before the refetch lands, the card gets a usable rating: the store
+    // recomputes it from the table instead of handing out an entry with no rank.
+    const advertised = store.advertised()
+    assert.equal(advertised[0].rank.grade, 'S')
+    assert.equal(advertised[0].rank.source, 'table')
+
+    // A malformed rank is recomputed, not trusted and not dropped.
+    const { decodeState } = await import(here('src/store.ts'))
+    const tampered = decodeState({
+      version: 1,
+      catalogVersion: 3,
+      selected: ['big-pickle'],
+      models: [
+        { id: 'big-pickle', name: 'Big Pickle', freeLane: true, rank: { score: 'high', grade: 'Z' } },
+        { id: 'glm-5.3-flash-free', name: 'GLM', freeLane: true, rank: { score: 88, grade: 'A' } },
+      ],
+    })
+    assert.equal(tampered.models[0].rank.grade, 'B', 'a garbage rank falls back to the table')
+    assert.equal(tampered.models[1].rank.score, 88, 'a good rank is read back verbatim')
+
+    // Fresh entries get their rank at merge time, before they ever touch disk.
+    const merged = mergeCatalog(
+      ['space-bunny-free', 'brand-new-thing'],
+      decodeModelsDev({
+        opencode: {
+          models: {
+            'space-bunny-free': { cost: { input: 0, output: 0 }, limit: { context: 1048576, output: 524288 } },
+            'brand-new-thing': { cost: { input: 0, output: 0 }, reasoning: true, reasoning_options: [{ type: 'effort', values: ['low', 'high'] }] },
+          },
+        },
+      }),
+    )
+    assert.equal(merged.find((model) => model.id === 'space-bunny-free').rank.source, 'table')
+    const fresh = merged.find((model) => model.id === 'brand-new-thing').rank
+    assert.equal(fresh.source, 'heuristic')
+    assert.match(fresh.note, /2 档推理/u, 'the ladder it actually declared is reported back')
+
+    // The card must be able to tell a published window from the number the
+    // adapter falls back to. brand-new-thing has no limit upstream, so its
+    // 262144 is a placeholder and has to be flagged as such.
+    const known = merged.find((model) => model.id === 'space-bunny-free')
+    assert.equal(known.limitsKnown, true, 'a window models.dev published is known')
+    const unknown = merged.find((model) => model.id === 'brand-new-thing')
+    assert.equal(unknown.limitsKnown, false, 'a fallback window is not known')
+    assert.equal(unknown.contextWindow, DEFAULT_CONTEXT_WINDOW, 'the placeholder is still what the adapter sends')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+await step('refresh: a dead models.dev keeps the cached ladders and windows', async () => {
+  const { refreshCatalog, mergeCatalog, decodeModelsDev } = await import(here('src/catalog.ts'))
+  const zen = { body: JSON.stringify({ object: 'list', data: [{ id: 'space-bunny-free' }, { id: 'big-pickle' }] }) }
+
+  // What the cache holds from the last good refresh.
+  const previous = mergeCatalog(
+    ['space-bunny-free', 'big-pickle'],
+    decodeModelsDev({
+      opencode: {
+        models: {
+          'space-bunny-free': { cost: { input: 0, output: 0 }, limit: { context: 1048576, output: 524288 }, reasoning: true, reasoning_options: [{ type: 'effort', values: ['low', 'high', 'max'] }] },
+          'big-pickle': { cost: { input: 0, output: 0 }, limit: { context: 200000, output: 32000 }, reasoning: true, reasoning_options: [] },
+        },
+      },
+    }),
+  )
+  assert.equal(previous.find((model) => model.id === 'space-bunny-free').contextWindow, 1048576)
+
+  // models.dev rejects; zen still answers. This is the exact shape of the
+  // failure that used to blank the whole catalogue: mergeCatalog was handed an
+  // empty map, so every ladder vanished and every window became 262144.
+  const result = await refreshCatalog({
+    previous,
+    fetchImpl: async (url) => {
+      if (String(url).includes('models.dev')) return new Response('nope', { status: 503 })
+      return new Response(zen.body, { status: 200, headers: { 'content-type': 'application/json' } })
+    },
+  })
+  const bunny = result.models.find((model) => model.id === 'space-bunny-free')
+  assert.equal(bunny.contextWindow, 1048576, 'the published window survives the failed refresh')
+  assert.equal(bunny.maxTokens, 524288)
+  assert.equal(bunny.limitsKnown, true, 'and it is still reported as known')
+  assert.deepEqual(bunny.effortValues, ['low', 'high', 'max'], 'the ladder survives too')
+  assert.equal(bunny.reasoning, true, 'so the effort picker does not disappear')
+  assert.equal(result.enriched, false)
+  assert.equal(result.complete, false, 'a partial answer must not claim to be complete')
+  assert.match(result.warning, /models\.dev/u, 'and it has to say so')
 })
 
 await step('probe classification matches the measured upstream shapes', async () => {
@@ -253,7 +457,7 @@ await step('probe never throws and reports a timeout as unknown, not unavailable
   assert.equal(typeof good.ms, 'number')
 })
 
-await step('store: round-trip, tick order, nothing ticked → nothing advertised', async () => {
+await step('store: round-trip, advertised order by capability, nothing ticked → nothing advertised', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'fmo-store-'))
   try {
     const { ModelStore } = await import(here('src/store.ts'))
@@ -265,19 +469,29 @@ await step('store: round-trip, tick order, nothing ticked → nothing advertised
     assert.deepEqual(store.advertised(), [], 'first run advertises nothing')
 
     const models = [
-      { id: 'a', name: 'A', freeLane: true, deprecated: false, contextWindow: 1000, maxTokens: 100, image: false },
+      // `big-pickle` is in the hand table; `b` is not rated at all. The pair
+      // therefore pins both halves of the advertised order at once.
+      { id: 'big-pickle', name: 'Big Pickle', freeLane: true, deprecated: false, contextWindow: 1000, maxTokens: 100, image: false },
       { id: 'b', name: 'B', freeLane: true, deprecated: false, contextWindow: 2000, maxTokens: 200, image: false },
     ]
     await store.replaceCatalog(models, '2026-10-18T00:00:00.000Z')
     assert.deepEqual(store.advertised(), [], 'a fresh catalogue does not auto-select anything')
 
-    await store.setSelected(['b', 'a', 'b', 'no-such-model'])
-    assert.deepEqual(store.advertised().map((model) => model.id), ['b', 'a'], 'tick order kept, unknowns dropped')
+    await store.setSelected(['b', 'big-pickle', 'b', 'no-such-model'])
+    assert.deepEqual(
+      store.advertised().map((model) => model.id),
+      ['big-pickle', 'b'],
+      'advertised order is capability, not tick order; duplicates and unknowns dropped',
+    )
+    assert.deepEqual(store.state.selected, ['b', 'big-pickle'], 'the tick list itself keeps your click order')
     assert.ok(changes >= 1, 'advertised-set changes notify the host')
 
     const reloaded = new ModelStore(dir)
     await reloaded.load()
-    assert.deepEqual(reloaded.advertised().map((model) => model.id), ['b', 'a'], 'selection survives a restart')
+    assert.deepEqual(reloaded.advertised().map((model) => model.id), ['big-pickle', 'b'], 'selection survives a restart')
+    assert.deepEqual(reloaded.state.selected, ['b', 'big-pickle'], 'and so does the click order')
+    assert.equal(reloaded.loaded, true)
+    assert.equal(reloaded.advertised()[0].rank.grade, 'B', 'a hand rating survives the disk round-trip')
     assert.equal(reloaded.state.lastRefresh, '2026-10-18T00:00:00.000Z')
 
     // A 0.1.0 state file listed the whole gateway, paid models included. Loading
@@ -286,7 +500,7 @@ await step('store: round-trip, tick order, nothing ticked → nothing advertised
       join(dir, 'dsh-freemodels-opencode', 'state.json'),
       JSON.stringify({
         version: 1,
-        selected: ['a', 'claude-opus-5'],
+        selected: ['claude-opus-5', 'b', 'big-pickle'],
         models: [
           ...models,
           { id: 'claude-opus-5', name: 'Opus', freeLane: false, deprecated: false, contextWindow: 1, maxTokens: 1, image: true },
@@ -298,13 +512,13 @@ await step('store: round-trip, tick order, nothing ticked → nothing advertised
     )
     const upgraded = new ModelStore(dir)
     await upgraded.load()
-    assert.deepEqual(upgraded.state.models.map((model) => model.id), ['a', 'b'], 'paid ids are dropped on load')
-    assert.deepEqual(upgraded.state.selected, ['a'], 'a paid tick is dropped with its model')
+    assert.deepEqual(upgraded.state.models.map((model) => model.id), ['big-pickle', 'b'], 'paid ids are dropped on load')
+    assert.deepEqual(upgraded.state.selected, ['b', 'big-pickle'], 'a paid tick is dropped, the rest keep their order')
     const rewritten = JSON.parse(await readFile(join(dir, 'dsh-freemodels-opencode', 'state.json'), 'utf8'))
-    assert.deepEqual(rewritten.models.map((model) => model.id), ['a', 'b'], 'the pruned catalogue is written back')
+    assert.deepEqual(rewritten.models.map((model) => model.id), ['big-pickle', 'b'], 'the pruned catalogue is written back')
 
-    await reloaded.replaceCatalog([models[0]], '2026-10-18T01:00:00.000Z')
-    assert.deepEqual(reloaded.advertised().map((model) => model.id), ['a'], 'vanished models are un-ticked')
+    await reloaded.replaceCatalog([models[1]], '2026-10-18T01:00:00.000Z')
+    assert.deepEqual(reloaded.advertised().map((model) => model.id), ['b'], 'vanished models are un-ticked')
 
     const raw = JSON.parse(await readFile(join(dir, 'dsh-freemodels-opencode', 'state.json'), 'utf8'))
     assert.equal(raw.version, 1)
@@ -372,6 +586,14 @@ await step('bridge: guard, methods, refresh, select, probe scopes', async () => 
     assert.equal(status.json.ok, true)
     assert.equal(status.json.value.models.length, 2)
     assert.deepEqual(status.json.value.selected, [])
+    // The card renders the context size and the rating letter from these two
+    // fields, so a bridge that dropped them would leave an unlabelled list.
+    const summaryModel = status.json.value.models[0]
+    assert.equal(typeof summaryModel.contextWindow, 'number')
+    assert.equal(typeof summaryModel.maxTokens, 'number')
+    assert.ok(['S', 'A', 'B', 'C'].includes(summaryModel.rank.grade), `bad grade ${summaryModel.rank.grade}`)
+    assert.equal(typeof summaryModel.rank.score, 'number')
+    assert.match(summaryModel.rank.note, /评级/u, 'the rating always explains itself')
 
     const refreshed = await call(at('refresh'), { method: 'POST', body: {} })
     assert.equal(refreshed.json.ok, true, JSON.stringify(refreshed.json))
@@ -383,7 +605,14 @@ await step('bridge: guard, methods, refresh, select, probe scopes', async () => 
 
     const selected = await call(at('select'), { method: 'POST', body: { selected: ['m-looks-free', 'm-good-free', 'ghost'] } })
     assert.deepEqual(selected.json.value.selected, ['m-looks-free', 'm-good-free'], 'unknown ids are dropped')
-    assert.deepEqual(store.advertised().map((model) => model.id), ['m-looks-free', 'm-good-free'])
+    assert.deepEqual(store.state.selected, ['m-looks-free', 'm-good-free'], 'the tick list keeps the posted order')
+    // Both ids are unrated, so they score the same and the order falls back to
+    // the id — which is exactly the tie-break, and it is not the posted order.
+    assert.deepEqual(store.advertised().map((model) => model.id), ['m-good-free', 'm-looks-free'])
+    assert.ok(
+      store.advertised().every((model) => model.rank.source === 'heuristic'),
+      'a hand-written catalogue literal is still given a usable rating',
+    )
 
     const one = await call(at('probe'), { method: 'POST', body: { scope: 'one', id: 'm-good-free' } })
     assert.equal(one.json.value.results[0].verdict, 'available')
@@ -466,15 +695,24 @@ await step('adapter: only ticked models are advertised, empty tick list advertis
     const store = new ModelStore(dir)
     await store.load()
     await store.replaceCatalog(
-      [{ id: 'big-pickle', name: 'Big Pickle', freeLane: true, deprecated: false, contextWindow: 4096, maxTokens: 512, image: false }],
+      [
+        { id: 'big-pickle', name: 'Big Pickle', freeLane: true, deprecated: false, contextWindow: 4096, maxTokens: 512, image: false },
+        { id: 'space-bunny-free', name: 'Space Bunny', freeLane: true, deprecated: false, contextWindow: 8192, maxTokens: 1024, image: false },
+      ],
       '',
     )
     const adapter = new OpenCodeAdapter(store, {})
 
     assert.deepEqual(await adapter.listModels('opencode'), [], 'zero ticks → empty catalogue')
-    await store.setSelected(['big-pickle'])
+    // Ticked in the weak-first order on purpose: the picker must not inherit it.
+    await store.setSelected(['big-pickle', 'space-bunny-free'])
     const listed = await adapter.listModels('opencode')
-    assert.deepEqual(listed, [{ provider: 'opencode', id: 'big-pickle', name: 'Big Pickle', inputModalities: ['text'] }])
+    assert.deepEqual(
+      listed.map((model) => model.id),
+      ['space-bunny-free', 'big-pickle'],
+      'the model picker lists the strongest model first, whatever order you ticked',
+    )
+    assert.deepEqual(listed[1], { provider: 'opencode', id: 'big-pickle', name: 'Big Pickle', inputModalities: ['text'] })
 
     const resolved = await adapter.resolveModel('opencode', 'big-pickle')
     assert.equal(resolved.context.contextWindow, 4096)
@@ -529,16 +767,13 @@ await step('adapter: reasoning efforts are advertised and reach the wire', async
     assert.deepEqual(ladder.reasoning?.efforts.map((entry) => entry.id), ['off', 'low', 'high'])
     assert.deepEqual(ladder.reasoning?.efforts.map((entry) => entry.name), ['Off', 'Low', 'High'])
 
-    // No declared ladder: fall back to a default one rather than refusing to
-    // reason at all — otherwise picking a level hits UNSUPPORTED_REASONING_EFFORT.
+    // No declared ladder: fall back to the four spellings measured working on
+    // this lane rather than refusing to reason at all — otherwise picking a
+    // level hits UNSUPPORTED_REASONING_EFFORT. The ladder deliberately stays
+    // inside none/low/high/max: a level the gateway does not accept is a hard
+    // 400 on every turn, so inventing `minimal` or `medium` would be a trap.
     const levels = await adapter.resolveModel('opencode', 'levels-free')
-    assert.deepEqual(levels.reasoning?.efforts.map((entry) => entry.id), [
-      'off',
-      'minimal',
-      'low',
-      'medium',
-      'high',
-    ])
+    assert.deepEqual(levels.reasoning?.efforts.map((entry) => entry.id), ['off', 'low', 'high', 'max'])
 
     const plain = await adapter.resolveModel('opencode', 'plain-free')
     assert.equal(plain.reasoning, undefined, 'a non-reasoning model advertises nothing')

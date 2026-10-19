@@ -13,10 +13,18 @@
  * are dropped here rather than hidden in the UI, so a priced id can never reach
  * the picker, the probe queue, the state file or the harness catalogue.
  */
+import { rankModel, type ModelRank } from './rank.ts'
 import { disguiseHeaders, probeRequestIDs } from './zen-ids.ts'
 
 export const ZEN_BASE_URL = 'https://opencode.ai/zen'
 const MODELS_DEV_URL = 'https://models.dev/api.json'
+/**
+ * models.dev is a 5.8 MB document and measured 15 s on a good connection, so
+ * the generic 30 s budget was too tight: a timeout here used to blank every
+ * reasoning ladder in the cache. Ninety seconds plus one retry covers a slow
+ * start without leaving the user staring at a spinner forever.
+ */
+const MODELS_DEV_TIMEOUT_MS = 90_000
 const FETCH_TIMEOUT_MS = 30_000
 
 export const DEFAULT_CONTEXT_WINDOW = 262_144
@@ -46,12 +54,28 @@ export interface ModelMeta {
   deprecated: boolean
   contextWindow: number
   maxTokens: number
+  /**
+   * Whether {@link contextWindow}/{@link maxTokens} came from models.dev rather
+   * than from the fallback constants.
+   *
+   * The two numbers are always present because the adapter has to send
+   * something, but a card that prints the fallback is telling the user
+   * "262144" when the truth is "nobody told us". When this is false the UI says
+   * the size is unknown instead of inventing one.
+   */
+  limitsKnown: boolean
   /** Metadata declares image input. */
   image: boolean
   /** Metadata declares the model thinks, so the harness may offer effort levels. */
   reasoning: boolean
   /** Effort spellings the gateway accepts for this model, as declared upstream. */
   effortValues: string[]
+  /**
+   * Free-lane capability rating. Editorial, not a benchmark — see `src/rank.ts`.
+   * Carried on every catalogue entry so the card, the state file and the model
+   * picker all read the same number instead of each deciding on its own.
+   */
+  rank: ModelRank
 }
 
 interface DevModel {
@@ -81,6 +105,11 @@ function numeric(value: unknown): number | undefined {
 export interface CatalogOptions {
   fetchImpl?: typeof fetch
   baseUrl?: string
+  /**
+   * The catalogue as already cached. Entries models.dev fails to describe this
+   * time inherit these values instead of being reset to the fallback constants.
+   */
+  previous?: readonly ModelMeta[]
 }
 
 /** `{"object":"list","data":[{"id":"big-pickle", ...}]}` → ids, order preserved. */
@@ -200,13 +229,30 @@ export function decodeModelsDev(data: unknown): Map<string, DevModel> {
   return out
 }
 
+/**
+ * Fetch models.dev, retrying once on a timeout.
+ *
+ * This document decides every model's effort ladder and context window, and a
+ * miss is not a cosmetic problem — it makes the effort selector disappear. One
+ * retry is cheap against a sixty-second wait for the user to notice and press
+ * the button again.
+ */
 export async function fetchModelsDev(fetchImpl: typeof fetch = fetch): Promise<Map<string, DevModel>> {
-  const response = await fetchImpl(MODELS_DEV_URL, {
-    headers: { accept: 'application/json', 'user-agent': 'dsh-freemodels-opencode' },
-    signal: withTimeout(),
-  })
-  if (!response.ok) throw new Error(`models.dev answered HTTP ${response.status}`)
-  return decodeModelsDev(await response.json())
+  let lastError: unknown
+  for (const attempt of [1, 2]) {
+    try {
+      const response = await fetchImpl(MODELS_DEV_URL, {
+        headers: { accept: 'application/json', 'user-agent': 'dsh-freemodels-opencode' },
+        signal: AbortSignal.timeout(MODELS_DEV_TIMEOUT_MS),
+      })
+      if (!response.ok) throw new Error(`models.dev answered HTTP ${response.status}`)
+      return decodeModelsDev(await response.json())
+    } catch (error) {
+      lastError = error
+      if (attempt === 1) continue
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError))
 }
 /**
  * Heuristic pre-filter only — the probe is the only authority on reachability.
@@ -233,22 +279,53 @@ function positive(value: number | undefined): number | undefined {
  * The filter lives here, at the single point where ids become metadata, so the
  * paid models never exist downstream: not in the state file, not in `/status`,
  * not in the probe sweep, and not in what the harness is offered.
+ *
+ * `previous` is what the cache already knew. models.dev is a 5.8 MB document
+ * that takes fifteen seconds and times out often; when it does, merging against
+ * an empty map would silently erase every reasoning ladder and reset every
+ * window to the fallback. That is a much worse outcome than a slightly stale
+ * catalogue: the user's effort selector disappears and nothing explains why. So
+ * a model whose upstream description is missing this time keeps the one it had.
  */
-export function mergeCatalog(ids: string[], dev: Map<string, DevModel>): ModelMeta[] {
+export function mergeCatalog(ids: string[], dev: Map<string, DevModel>, previous: readonly ModelMeta[] = []): ModelMeta[] {
+  const known = new Map(previous.map((model) => [model.id, model]))
   const models: ModelMeta[] = []
   for (const id of ids) {
     const entry = dev.get(id)
     if (!isFreeLane(id, entry)) continue
+    const cached = known.get(id)
+    // Only fall back to the cache when models.dev said nothing at all about this
+    // id. An entry that exists but declares no ladder is a real answer ("this
+    // model has no levels"), not a missing one, and must not be papered over.
+    const inherit = entry === undefined ? cached : undefined
+
+    const effortValues = entry === undefined ? (inherit?.effortValues ?? []) : entry.effortValues
+    const reasoning = entry === undefined ? inherit?.reasoning === true : entry.reasoning === true
+    const contextWindow =
+      positive(entry?.contextWindow) ?? (entry === undefined ? positive(inherit?.contextWindow) : undefined) ?? DEFAULT_CONTEXT_WINDOW
+    const maxTokens =
+      positive(entry?.maxOutput) ?? (entry === undefined ? positive(inherit?.maxTokens) : undefined) ?? DEFAULT_MAX_TOKENS
+    // "Known" means a published description is behind the numbers — either the
+    // one from this refresh or the one carried over from the last good one.
+    const limitsKnown =
+      positive(entry?.contextWindow) !== undefined ||
+      positive(entry?.maxOutput) !== undefined ||
+      (inherit !== undefined && inherit.limitsKnown)
+
     models.push({
       id,
-      name: entry?.name ?? id,
+      name: entry?.name ?? inherit?.name ?? id,
       freeLane: true,
-      deprecated: entry?.deprecated === true,
-      contextWindow: positive(entry?.contextWindow) ?? DEFAULT_CONTEXT_WINDOW,
-      maxTokens: positive(entry?.maxOutput) ?? DEFAULT_MAX_TOKENS,
-      image: entry?.image === true,
-      reasoning: entry?.reasoning === true,
-      effortValues: entry?.effortValues ?? [],
+      deprecated: entry?.deprecated === true || (entry === undefined && inherit?.deprecated === true),
+      contextWindow,
+      maxTokens,
+      limitsKnown,
+      image: entry === undefined ? inherit?.image === true : entry.image === true,
+      reasoning,
+      effortValues,
+      // Rated from the upstream metadata rather than a bare id, so a model that
+      // actually declares an effort ladder is not penalised as if it were blank.
+      rank: rankModel({ id, contextWindow, reasoning, effortValues }),
     })
   }
   return models.sort((a, b) => a.id.localeCompare(b.id))
@@ -260,6 +337,8 @@ export interface RefreshResult {
   fetchedAt: string
   /** True when models.dev enriched the list; false when it was unreachable. */
   enriched: boolean
+  /** True when no model lost its metadata, i.e. the cache is safe to replace. */
+  complete: boolean
   warning?: string
 }
 
@@ -272,15 +351,18 @@ export async function refreshCatalog(options: CatalogOptions = {}): Promise<Refr
   if (zen.status === 'rejected') {
     throw zen.reason instanceof Error ? zen.reason : new Error(String(zen.reason))
   }
-  const models = mergeCatalog(zen.value, dev.status === 'fulfilled' ? dev.value : new Map())
+  const enriched = dev.status === 'fulfilled'
+  const models = mergeCatalog(zen.value, enriched ? dev.value : new Map(), options.previous ?? [])
+  // A partial answer is still worth publishing (the id list itself may have
+  // changed), but it must not be treated as a fresh description of every model.
+  const complete = enriched && models.every((model) => model.limitsKnown)
   return {
     models,
     fetchedAt: new Date().toISOString(),
-    enriched: dev.status === 'fulfilled',
+    enriched,
+    complete,
     ...(dev.status === 'rejected'
-      ? { warning: `模型清单已更新，但 models.dev 元数据不可用（上下文窗口用默认值）：${
-          dev.reason instanceof Error ? dev.reason.message : String(dev.reason)
-        }` }
+      ? { warning: `models.dev 元数据这次没拉到（${dev.reason instanceof Error ? dev.reason.message : String(dev.reason)}）：清单已更新，但沿用上次的上下文窗口和推理档位，不会清空。` }
       : {}),
   }
 }

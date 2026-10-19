@@ -5,6 +5,7 @@
 - **刷新模型**：一键从上游重新拉清单（含 models.dev 的上下文窗口、弃用标记）。
 - **勾选启用**：勾上的模型才会以 provider `opencode` 出现在模型选择器里；**一个都不勾 = 一个都不显示**。
 - **测试能不能用**：对单个模型或全部已勾选模型发一个真实尺寸的请求，给出七档结论，而不是让你自己瞎试。
+- **按能力排序**：每个模型带一枚 S/A/B/C 人工评级徽章，卡片和模型选择器用同一个顺序，最强的排最前。
 
 界面在 **设置 → 模型** 页底部，标题「opencode 免费模型」。
 
@@ -12,7 +13,7 @@
 
 ## 为什么需要它
 
-上游 `https://opencode.ai/zen/v1/models` 现在返回 85 个模型 id，其中 76 个是付费模型。本插件**在拉取时就把付费的丢掉**，只留免费车道的那 9 个左右，所以卡片里、探测队列里、状态文件里都不会出现付费 id。
+上游 `https://opencode.ai/zen/v1/models` 现在返回 85 个模型 id，其中 76 个是付费模型。本插件**在拉取时就把付费的丢掉**，当前只留免费车道的 9 个，所以卡片里、探测队列里、状态文件里都不会出现付费 id。
 
 免费车道的判定不只看 `-free` 后缀：`big-pickle` 不带后缀也在车道上，反过来有些模型带 free 却在黑名单里。
 
@@ -47,6 +48,22 @@ dsh plugin --profile desktop add .
 
 > 免费车道的判定是启发式的（黑名单 → 已知白名单 → models.dev 零价 → 名字含 free）。如果某个刚上线的免费模型没被识别出来，或者某个付费模型混了进来，点 **刷新模型** 会重新判定；判定逻辑在 `src/catalog.ts` 的 `isFreeLane`。
 
+### 排序与评级
+
+卡片上方有三个排序按钮，默认 **按能力**：
+
+| 排序 | 含义 |
+| --- | --- |
+| 按能力 | 按评级从高到低，评级相同再按上下文量 —— 和模型选择器里的顺序完全一致 |
+| 按名称 | 按模型名字母排 |
+| 按上下文 | 按上下文窗口从大到小 |
+
+每行左边的 **S/A/B/C 徽章是人工评级，不是跑分结果**。它是对这批模型「干长活儿稳不稳」的手工判断，分 S（90+）、A（80+）、B（70+）、C 四段；鼠标悬停徽章会看到每个模型的具体理由。想调整顺序就编辑插件里的 `src/rank.ts` —— 改分数和理由都在那儿，其余代码不用动。
+
+没在人工表里的新模型会走关键词启发式打分（看 id 里的版本号和 `flash`/`preview` 这类档位词），并且**被压到人工评级之下**（上限 61 分），所以明天上游冒出来的新模型只会排到列表末尾，不会顶掉谁。
+
+上下文窗口后缀 K/M 按 2 的幂换算（262144 → 256K），手写整数（200000 → 200K）按 1000 换算，两种上游数字都能对上数据手册。
+
 ### 七档结论
 
 | 结论 | 含义 | 该怎么办 |
@@ -65,9 +82,19 @@ dsh plugin --profile desktop add .
 
 ### 推理档位
 
-免费模型里有 7 个支持推理档位，但各自能选的不一样（`beam-free` 是 low/medium/high/xhigh/max，`deepseek-v4.1-flash-free` 只有 low/high/max，`big-pickle` 上游没声明就按 off/minimal/low/medium/high 给）。插件把这些声明从 models.dev 读进目录，通过 `LlmAdapter.resolveModel()` 的 `reasoning.efforts` 交给 harness，所以你才能在模型选择器里看到档位、选得动。选中的档位在请求里落成 `reasoning_effort`（`off` 发出去是 `none`）。
+免费模型全部声明支持推理档位，但各自能选的不一样：`space-bunny-free` / `beam-free` 是 low/medium/high/xhigh/max，`nemotron-3.5-super-vl-free` 最全（none→xhigh），`deepseek-v4.1-flash-free` 和 `glm-5.3-flash-free` 只有 low/high/max，而 `big-pickle` / `mimo-v2.6-flash-free` / `longcat-2.5-preview-free` / `nemotron-3.5-lightning-free` 上游没声明，插件就给默认四档 **off / low / high / max**。
+
+默认四档是实测过这条车道能接受的写法，中间档（medium）被故意去掉：档位写错是每一轮都硬 400，而不是降级。你想改成别的档位表，改 `src/adapter.ts` 的 `DEFAULT_EFFORT_LADDER` —— 顺带说明，DSH 自带的 `dsh-thinking-slider`「补齐四档」功能在这里没用，它改的是 `llm-pi-ai` 的 provider 表，而 `opencode` 是本插件自己的 provider。
+
+插件把这些声明从 models.dev 读进目录，通过 `LlmAdapter.resolveModel()` 的 `reasoning.efforts` 交给 harness，所以你才能在模型选择器里看到档位、选得动。选中的档位在请求里落成 `reasoning_effort`（`off` 发出去是 `none`）。
 
 如果某个模型在 DSH 里还是选不到档位：先点 **刷新模型** 重新拉一次元数据，再重启 DSH。档位来自目录，目录没刷新就不会出现在选择器里。
+
+models.dev 是个 5.8 MB 的大文档，实测要 15 秒左右，超时也不少见。所以插件把超时放宽到 90 秒并重试一次；**万一还是失败，模型会沿用上次成功拉到的档位和窗口，而不是被清空** —— 一次抓取失败不该让你重新选一遍档位。
+
+### 上下文未知是什么意思
+
+卡片上如果显示「上下文未知」，说明 models.dev 这次没有这个模型的记录，那两个数字只是插件的兜底常数，不是任何人公布的值。这时插件不会把 262144 印出来冒充真实窗口，你点 **刷新模型** 重试即可。
 
 ### 会话里失败时
 
@@ -85,12 +112,13 @@ dsh plugin --profile desktop add .
 ```bash
 npm run typecheck   # 宿主 + 客户端两套 tsconfig
 npm run check       # build + 三组离线冒烟，全都不打上游
-npm run selftest    # 14 组：会话头、清单、档位、分类、存储、路由、adapter、SSE、bundle
+npm run selftest    # 17 组：会话头、清单、评级、档位、分类、存储、路由、adapter、SSE、bundle
 npm run render      # 用真 React 渲染构建产物里那张卡，验首帧不崩
 npm run interaction # jsdom 里点一遍：勾选、单条测试、刷新、批量测试、失败路径
 node scripts/live-check.mjs                        # 可选，真打上游：刷新清单并逐个测，打印七档结论
 node scripts/live-smoke.mjs                        # 可选，真打上游：走一遍 adapter 的流式链路
 node scripts/integration.mjs                       # 可选，要 FMO_HOST_MODULES
+node scripts/refresh-now.mjs <state.json 路径>      # 可选，绕过界面原地重刷真实 state 文件
 ```
 
 `integration.mjs` 把宿主真的 `LlmRuntime` 拉起来跑一遍注册与流式，能抓到离线用例抓不到的契约漂移。宿主把 `@deepseek-ai/*` 打进 `app.asar`，普通 node 进程 import 不了，所以要用解包出来的依赖树：
@@ -101,6 +129,8 @@ FMO_HOST_MODULES=/path/to/extracted/@deepseek-ai/tree node scripts/integration.m
 
 没设这个变量就跳过，不算失败。
 
+`refresh-now.mjs` 会真打上游并真写 state 文件，所以**故意不挂在 `npm run check` 上** —— 只在旧版本把缓存搞脏、又不想重启 DSH 时手动跑一次。
+
 `render` 和 `interaction` 需要 `react-dom`，`interaction` 还需要 `jsdom`。两者都是 devDependency，装了 `node_modules` 就有；缺了会跳过而不是失败。
 
 ## 它怎么实现的（给想改的人）
@@ -108,6 +138,7 @@ FMO_HOST_MODULES=/path/to/extracted/@deepseek-ai/tree node scripts/integration.m
 | 文件 | 作用 |
 | --- | --- |
 | `src/zen-ids.ts` | 免费车道要求的 `ses_*` 会话 id 与 7 个伪装头 |
+| `src/rank.ts` | 人工评级表与能力排序（**改顺序只需要动这个文件**） |
 | `src/catalog.ts` | 拉 Zen 清单 + models.dev 元数据，**丢掉付费模型**后合并出 `ModelMeta[]` |
 | `src/probe.ts` | 单模型探测与七档分类（永不抛异常） |
 | `src/store.ts` | `$DSH_HOME/data/dsh-freemodels-opencode/state.json`，串行写、原子替换 |
@@ -118,8 +149,20 @@ FMO_HOST_MODULES=/path/to/extracted/@deepseek-ai/tree node scripts/integration.m
 
 关键设计：**模型清单的权威是这个插件自己**。`LlmAdapter.listModels()` 返回的就是勾选集，勾选为空时返回 `[]` —— 宿主允许空目录，于是模型选择器里干干净净什么都不显示，正是要的行为。
 
+模型选择器里的顺序也是 `rank.ts` 定的能力序，不是勾选顺序：能力值、上下文窗口、档位深度都进 `src/store.ts` 的 `#advertised()` 指纹，任一变化都会触发重新发布，所以改评级不用重启 DSH。
+
 ## 许可
 
 MIT。`src/zen-ids.ts` / 免费车道闸门 / models.dev 解码 / 错误分类的原始协议工作来自 [opencode2dsh](https://github.com/FishBottle7/opencode2dsh)（MIT, Copyright (c) 2026 FishBottle7），详见 [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md)。
 
 上游服务由 OpenCode 运营，与本项目无关。
+
+## 更新说明
+
+### v0.2.0
+
+- 模型卡片与模型选择器统一改为**按人工评级（`src/rank.ts`）排序**，S/A/B/C 徽章 + 悬停理由。
+- 卡片新增 **按能力 / 按名称 / 按上下文** 三种排序；勾选与否不再影响行顺序。
+- 上下文与输出上限带 **「已知 / 未知」** 标记，上游没公布时不再把兜底常数当真实窗口印出来。
+- models.dev 拉取超时放宽到 90 秒并重试一次；拉取失败时**沿用上次的档位与窗口**，不再清空。
+- 未声明档位的模型默认档位改为实测可用的 **off / low / high / max**（原先含 medium，会硬 400）。

@@ -7,6 +7,7 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS, type ModelMeta } from './catalog.ts'
+import { compareByCapability, rankModel, type Grade, type ModelRank } from './rank.ts'
 
 export interface StoreState {
   version: 1
@@ -16,15 +17,24 @@ export interface StoreState {
    * once on load so effort levels are not silently missing after an upgrade.
    */
   catalogVersion: number
-  /** Tick order is the order models are advertised to the harness. */
+  /**
+   * Tick order is only how the card remembers what you picked; the advertised
+   * order is capability, see {@link ModelStore.advertised}.
+   */
   selected: string[]
   models: ModelMeta[]
   lastRefresh: string
   lastError: string
 }
 
-/** Current catalogue shape: 2 adds `reasoning` / `effortValues` per model. */
-export const CATALOG_VERSION = 2
+/**
+ * Current catalogue shape: 3 adds the capability `rank` per model, 4 adds
+ * `limitsKnown`. Both have to invalidate an older cache: a shape-3 file was
+ * written by a build that could not tell a published window from the fallback
+ * constant, so every entry in it may be carrying a made-up size. Refetching is
+ * the only way to find out which.
+ */
+export const CATALOG_VERSION = 4
 
 export const EMPTY_STATE: StoreState = {
   version: 1,
@@ -56,9 +66,59 @@ function decodeModel(raw: unknown): ModelMeta | undefined {
     deprecated: record?.deprecated === true,
     contextWindow: positive(record?.contextWindow, DEFAULT_CONTEXT_WINDOW),
     maxTokens: positive(record?.maxTokens, DEFAULT_MAX_TOKENS),
+    // Absent on a file written before the flag existed: those files recorded
+    // fallback sizes as if they were real, so the honest reading is "unknown".
+    limitsKnown: record?.limitsKnown === true,
     image: record?.image === true,
     reasoning: record?.reasoning === true,
     effortValues: decodeEfforts(record?.effortValues),
+    rank: decodeRank(record?.rank) ?? rankModel({ id, reasoning: record?.reasoning === true, effortValues: decodeEfforts(record?.effortValues) }),
+  }
+}
+
+const GRADES: ReadonlySet<string> = new Set<Grade>(['S', 'A', 'B', 'C'])
+
+/**
+ * Read a persisted rank, or recompute it.
+ *
+ * Older state files have no rank at all; anything malformed is recomputed rather
+ * than dropped, because a model with no rating is still a model the user ticked.
+ */
+function decodeRank(raw: unknown): ModelRank | undefined {
+  const record = asRecord(raw)
+  if (record === undefined) return undefined
+  const score = record.score
+  if (typeof score !== 'number' || !Number.isFinite(score)) return undefined
+  const grade = GRADES.has(String(record.grade)) ? (record.grade as Grade) : undefined
+  if (grade === undefined) return undefined
+  return {
+    score,
+    grade,
+    source: record.source === 'table' ? 'table' : 'heuristic',
+    note: typeof record.note === 'string' ? record.note : '',
+  }
+}
+
+/**
+ * Guarantee the derived fields on a catalogue entry.
+ *
+ * {@link decodeModel} already fills them in for anything read from disk, and
+ * `mergeCatalog` for anything fresh from upstream. This is the third door: a
+ * caller that hands `replaceCatalog` a hand-written literal — which the
+ * self-test does — must still get an advertised list instead of a crash on
+ * `.grade`.
+ *
+ * A literal that names its context window did so on purpose, so a missing
+ * `limitsKnown` there means "these numbers are real", not "upstream was down".
+ */
+function withDerived(model: ModelMeta): ModelMeta {
+  const rank = (model as { rank?: ModelRank }).rank
+  const limitsKnown = (model as { limitsKnown?: boolean }).limitsKnown
+  if (rank !== undefined && limitsKnown !== undefined) return model
+  return {
+    ...model,
+    rank: rank ?? rankModel(model),
+    limitsKnown: limitsKnown ?? true,
   }
 }
 
@@ -120,8 +180,9 @@ export async function loadState(dataDir: string): Promise<StoreState> {
  * sitting on disk pretending to be pickable.
  *
  * `stale` means the cached catalogue is missing fields this build needs (effort
- * levels arrived in catalogue shape 2). The caller refreshes once so upgraded
- * installs do not advertise models with silently missing reasoning levels.
+ * levels arrived in catalogue shape 2, the capability `rank` in 3). The caller
+ * refreshes once so upgraded installs do not advertise models with silently
+ * missing reasoning levels, nor show an unranked list.
  */
 async function readState(dataDir: string): Promise<{ state: StoreState; pruned: boolean; stale: boolean }> {
   try {
@@ -200,13 +261,13 @@ export class ModelStore {
   }
 
   #advertised(): string {
-    // Effort levels are part of the published catalogue: a model that gains or
-    // loses a level must republish, otherwise the picker keeps offering levels
-    // dsh-llm would now reject.
-    return this.#selectedModels()
+    // Effort levels and the rating are both part of the published catalogue: a
+    // model that gains or loses a level, or whose rating is retuned, changes
+    // what the picker offers or in which order, so either must republish.
+    return this.advertised()
       .map(
         (model) =>
-          `${model.id}|${model.contextWindow}|${model.maxTokens}|${model.image}|${model.reasoning}|${(model.effortValues ?? []).join('+')}`,
+          `${model.id}|${model.contextWindow}|${model.maxTokens}|${model.image}|${model.reasoning}|${(model.effortValues ?? []).join('+')}|${model.rank.grade}${model.rank.score}`,
       )
       .join(',')
   }
@@ -217,18 +278,23 @@ export class ModelStore {
       .filter((model): model is ModelMeta => model !== undefined)
   }
 
-  /** Models the harness should see, in tick order. Empty when nothing is ticked. */
+  /** Models the harness should see, strongest first. Empty when nothing is ticked. */
   advertised(): ModelMeta[] {
-    return this.#selectedModels()
+    // Capability order, not tick order: the model picker shows the first entries
+    // first, and the point of the rating is that the model you want most is
+    // already at the top. `compareByCapability` is total and stable, so this
+    // never reshuffles between two calls on the same catalogue.
+    return this.#selectedModels().sort(compareByCapability)
   }
 
   async replaceCatalog(models: ModelMeta[], lastRefresh: string): Promise<void> {
     await this.#mutate((state) => {
-      const known = new Set(models.map((model) => model.id))
+      const ranked = models.map(withDerived)
+      const known = new Set(ranked.map((model) => model.id))
       return {
         ...state,
         catalogVersion: CATALOG_VERSION,
-        models,
+        models: ranked,
         selected: state.selected.filter((id) => known.has(id)),
         lastRefresh,
         lastError: '',

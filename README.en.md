@@ -5,6 +5,7 @@ Brings **opencode Zen's anonymous free lane** into DeepSeek Harness, and answers
 - **Refresh the catalogue** — re-read the upstream model list, enriched with models.dev context windows and deprecation flags.
 - **Tick what you want** — only ticked models appear in the model picker under provider `opencode`. **Nothing ticked means nothing listed.**
 - **Test reachability** — probe one model or every ticked model with a minimal real request, and get a verdict instead of guessing.
+- **Sorted by capability** — every model carries an S/A/B/C hand rating, and both the card and the model picker use that same order, strongest first.
 
 The card lives at the bottom of **Settings → Models** ("opencode 免费模型").
 
@@ -12,7 +13,7 @@ This is an independent project. It does **not** modify or depend on [`@opencode2
 
 ## Why
 
-`https://opencode.ai/zen/v1/models` currently returns 85 model ids, 76 of them paid. This plugin **drops the paid ones at fetch time** and keeps only the ~9 free-lane models, so no paid id ever reaches the card, the probe queue, or the state file.
+`https://opencode.ai/zen/v1/models` currently returns 85 model ids, 76 of them paid. This plugin **drops the paid ones at fetch time** and keeps the 9 free-lane models currently on the lane, so no paid id ever reaches the card, the probe queue, or the state file.
 
 "Free lane" is not just the `-free` suffix: `big-pickle` has no suffix yet sits on the lane, and a few suffixed ids are blocklisted.
 
@@ -45,6 +46,22 @@ Restart Harness, open **Settings → Models**, and scroll to the bottom.
 
 > Free-lane detection is a heuristic (blocklist → known-good list → zero price on models.dev → `free` in the id). If a newly launched free model is missing, or a paid one slipped in, press **刷新模型** to re-decide; the rule lives in `isFreeLane` in `src/catalog.ts`.
 
+### Sorting and ratings
+
+Three sort buttons sit above the list; **按能力 / by capability** is the default.
+
+| Sort | Meaning |
+| --- | --- |
+| 按能力 / capability | Rating first, then context window — the exact order the model picker uses |
+| 按名称 / name | Alphabetical by model name |
+| 按上下文 / context | Largest context window first |
+
+The **S/A/B/C badge is a hand rating, not a benchmark.** It is one person's judgement of "how steady is this model on long working turns", banded S (90+), A (80+), B (70+), C. Hovering the badge shows the reason for that specific model. To retune the order, edit `src/rank.ts` — scores and reasons both live there, and nothing else needs to know.
+
+An id nobody has rated yet is scored by a keyword heuristic (version number in the id, plus tier words like `flash` / `preview`) and **capped below every hand rating** (61), so a model that appears upstream tomorrow lands at the bottom of the list instead of displacing a rating someone wrote on purpose.
+
+K/M suffixes follow the divisor the number implies: powers of two convert in binary (262144 → 256K), hand-written integers convert in decimal (200000 → 200K). Both kinds of upstream figure land on what the datasheet says.
+
 ### Verdicts
 
 | Verdict | Meaning | What to do |
@@ -63,9 +80,19 @@ Verdicts stay in memory only. Rate limits expire — persisting "unavailable" to
 
 ### Reasoning effort
 
-Seven of the free models take an effort level, and each declares a different ladder (`beam-free` low/medium/high/xhigh/max, `deepseek-v4.1-flash-free` only low/high/max, `big-pickle` declares none so the plugin offers off/minimal/low/medium/high). The plugin reads those declarations from models.dev into the catalogue and hands them to the harness through `reasoning.efforts` in `LlmAdapter.resolveModel()` — that is what makes the picker show them. A chosen level is sent as `reasoning_effort` (`off` goes out as `none`).
+Every free model declares an effort level, but each one accepts a different ladder: `space-bunny-free` / `beam-free` take low/medium/high/xhigh/max, `nemotron-3.5-super-vl-free` is the most complete (none→xhigh), `deepseek-v4.1-flash-free` and `glm-5.3-flash-free` take only low/high/max, and `big-pickle` / `mimo-v2.6-flash-free` / `longcat-2.5-preview-free` / `nemotron-3.5-lightning-free` declare nothing upstream, so the plugin offers the default four: **off / low / high / max**.
+
+Those four are the spellings measured working on this lane; the middle rung is left out on purpose because a level the gateway rejects is a hard 400 on every turn, not a downgrade. To change the set, edit `DEFAULT_EFFORT_LADDER` in `src/adapter.ts` — worth knowing that DSH's own `dsh-thinking-slider` "fill in four levels" action cannot help here: it edits the `llm-pi-ai` provider table, and `opencode` is this adapter's own provider.
+
+The plugin reads those declarations from models.dev into the catalogue and hands them to the harness through `reasoning.efforts` in `LlmAdapter.resolveModel()` — that is what makes the picker show them. A chosen level is sent as `reasoning_effort` (`off` goes out as `none`).
 
 If a model still offers no levels in DSH: press **刷新模型** to re-pull the metadata, then restart DSH. Levels come from the catalogue; an unrefreshed catalogue never reaches the picker.
+
+models.dev is a 5.8 MB document that measured around 15 s and times out often, so the budget is 90 s with one retry. **If it still fails, models keep the effort ladders and windows the last successful fetch brought in** rather than being blanked — one failed request should not cost you the whole effort selector.
+
+### What "上下文未知" means
+
+When the card reads 上下文未知 / context unknown, models.dev had no record of that model this time, so the two numbers are only the plugin's fallback constants — not values anyone published. The card then refuses to print 262144 as if it were a real window. Press **刷新模型** to retry.
 
 ### When a turn fails
 
@@ -83,12 +110,13 @@ The failure message carries the upstream window, e.g. `opencode: Rate limit exce
 ```bash
 npm run typecheck   # host + client tsconfigs
 npm run check       # build + three offline smokes, none touch upstream
-npm run selftest    # 14 suites: ids, catalogue, efforts, classification, store, routes, adapter, SSE, bundles
+npm run selftest    # 17 suites: ids, catalogue, rank, efforts, classification, store, routes, adapter, SSE, bundles
 npm run render      # renders the built card with real React to prove first paint
 npm run interaction # drives the card in jsdom: tick, probe one, refresh, bulk, failure
 node scripts/live-check.mjs                        # optional, real lane: refresh + classify every free model
 node scripts/live-smoke.mjs                        # optional, real lane: one full stream through the adapter
 node scripts/integration.mjs                       # optional, needs FMO_HOST_MODULES
+node scripts/refresh-now.mjs <path-to-state.json>  # optional, re-fetch and rewrite the real state file out of band
 ```
 
 `integration.mjs` boots the host's real `LlmRuntime` and runs registration plus a streamed call through it — drift the offline suites cannot see. The harness ships `@deepseek-ai/*` inside `app.asar`, which a plain node process cannot import, so point it at an extracted tree:
@@ -99,6 +127,8 @@ FMO_HOST_MODULES=/path/to/extracted/@deepseek-ai/tree node scripts/integration.m
 
 Unset, it skips instead of failing.
 
+`refresh-now.mjs` really hits upstream and really writes the state file, so it is **deliberately not wired into `npm run check`** — run it by hand when an older build poisoned the cache and you do not want to restart DSH.
+
 `render` needs `react-dom`; `interaction` also needs `jsdom`. Both are devDependencies, and both steps skip rather than fail when they are missing.
 
 ## How it works
@@ -106,6 +136,7 @@ Unset, it skips instead of failing.
 | File | Role |
 | --- | --- |
 | `src/zen-ids.ts` | The `ses_*` session id and seven disguise headers the free lane demands |
+| `src/rank.ts` | The hand rating table and capability order (**the only file to touch to retune it**) |
 | `src/catalog.ts` | Zen model list + models.dev metadata; **paid models dropped** before the merge into `ModelMeta[]` |
 | `src/probe.ts` | Single-model probe and the seven-way verdict classifier (never throws) |
 | `src/store.ts` | `$DSH_HOME/data/dsh-freemodels-opencode/state.json`, serial, atomic replace |
@@ -116,8 +147,20 @@ Unset, it skips instead of failing.
 
 The load-bearing decision: **this plugin is the authority on its own catalogue.** `LlmAdapter.listModels()` returns the ticked set, and `[]` when nothing is ticked — the host accepts an empty catalogue, so the picker shows nothing, which is exactly the requested behaviour.
 
+The picker order is that same capability order from `rank.ts`, not tick order. Rating, context window and ladder depth all feed the `#advertised()` fingerprint in `src/store.ts`, so retuning a rating republishes without a DSH restart.
+
 ## License
 
 MIT. The protocol work in `src/zen-ids.ts`, the free-lane gate, the models.dev decoding and the error classification derive from [opencode2dsh](https://github.com/FishBottle7/opencode2dsh) (MIT, Copyright (c) 2026 FishBottle7). See [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).
 
 Upstream services are operated by OpenCode and are not affiliated with this project.
+
+## Changelog
+
+### v0.2.0
+
+- The card and the model picker now share one order — the hand rating in `src/rank.ts` — with an S/A/B/C badge and a hover reason.
+- The card gained **按能力 / 按名称 / 按上下文** sorting; ticking a model no longer moves the other rows.
+- Context and output ceilings carry a **known / unknown** marker instead of printing the fallback constants as a real datasheet.
+- models.dev fetch gets a 90 s budget and one retry; a failed fetch now **keeps the previous ladders and windows** instead of blanking them.
+- Models that declare no ladder get the measured-working default **off / low / high / max** (`medium` used to be included and hard-400s).

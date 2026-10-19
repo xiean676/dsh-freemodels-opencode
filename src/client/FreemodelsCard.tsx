@@ -19,6 +19,13 @@ type ProbeVerdict =
   | 'exhausted'
   | 'unknown'
 
+interface ModelRank {
+  score: number
+  grade: string
+  source: 'table' | 'heuristic'
+  note: string
+}
+
 interface ModelRow {
   id: string
   name: string
@@ -27,8 +34,15 @@ interface ModelRow {
   image: boolean
   contextWindow: number
   maxTokens: number
+  /**
+   * Absent or false means the sizes below are the plugin's fallback constants,
+   * not values anyone published. The badge then says "未知" rather than
+   * repeating a number the user might mistake for the real window.
+   */
+  limitsKnown?: boolean
   reasoning: boolean
   effortValues: string[]
+  rank: ModelRank
 }
 
 interface ProbeResult {
@@ -111,6 +125,56 @@ function stamp(iso: string): string {
   return Number.isNaN(date.getTime()) ? iso : date.toLocaleString()
 }
 
+/**
+ * 200000 → "200K", 262144 → "256K", 1048576 → "1M".
+ *
+ * Upstreams mix two kinds of number: hand-written round figures (200000,
+ * 1000000) and powers of two (262144, 32768). Dividing everything by 1000
+ * would print 262144 as "262K" and 32768 as "33K", which contradicts the
+ * datasheet the user is comparing against; dividing everything by 1024 would
+ * print 200000 as "195K". So the divisor follows the number: an exact binary
+ * multiple is shown in binary units, anything else in decimal.
+ */
+function compactTokens(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return '?'
+
+  const trim = (scaled: number): string =>
+    String(scaled >= 10 ? Math.round(scaled) : Math.round(scaled * 10) / 10)
+
+  if (value >= 1_048_576) {
+    return `${trim(value % 1_048_576 === 0 ? value / 1_048_576 : value / 1_000_000)}M`
+  }
+  if (value >= 1024) {
+    return `${trim(value % 1024 === 0 ? value / 1024 : value / 1_000)}K`
+  }
+  return String(value)
+}
+
+/**
+ * Sort modes for the list. `capability` is the default and the same order the
+ * model picker uses, so the card and the picker never disagree about which
+ * model is strongest.
+ */
+type SortKey = 'capability' | 'name' | 'context'
+
+const SORT_LABEL: Record<SortKey, string> = {
+  capability: '按能力',
+  name: '按名称',
+  context: '按上下文',
+}
+
+/** A rating may be absent on a catalogue written by an older plugin build. */
+function rankOf(model: ModelRow): ModelRank {
+  return (
+    model.rank ?? {
+      score: 0,
+      grade: '?',
+      source: 'heuristic',
+      note: '这条记录没有评级，先点「刷新模型」重新拉一次清单。',
+    }
+  )
+}
+
 const CSS = `
 .fmo-card{display:flex;flex-direction:column;gap:12px;padding:14px 16px;border:1px solid var(--dsw-alias-border-l3,#333);border-radius:var(--dsw-radius-lg,12px);background:var(--dsw-alias-settings-card-fill,rgba(127,127,127,.06));}
 .fmo-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;}
@@ -140,6 +204,17 @@ const CSS = `
 .fmo-v-exhausted{color:var(--dsw-alias-state-error-primary,#ff6b6b);}
 .fmo-v-unknown{color:var(--dsw-alias-label-tertiary,#999);}
 .fmo-empty{padding:18px 12px;text-align:center;font-size:12px;color:var(--dsw-alias-label-tertiary,#888);}
+.fmo-sort{display:flex;align-items:center;gap:6px;flex-wrap:wrap;}
+.fmo-sort-label{font-size:11px;color:var(--dsw-alias-label-tertiary,#888);}
+.fmo-chip{font:inherit;font-size:11px;line-height:18px;padding:1px 9px;border-radius:999px;border:1px solid var(--dsw-alias-border-l3,#444);background:transparent;color:var(--dsw-alias-label-secondary,#aaa);cursor:pointer;}
+.fmo-chip:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.16));}
+.fmo-chip-on{border-color:var(--dsw-alias-button-primary-fill,#4c8dff);color:var(--dsw-alias-button-primary-fill,#4c8dff);font-weight:600;}
+.fmo-grade{display:inline-flex;align-items:baseline;gap:3px;flex:0 0 auto;font-size:11px;font-weight:700;line-height:15px;padding:0 6px;border-radius:999px;border:1px solid currentColor;}
+.fmo-grade-score{font-size:9px;font-weight:500;opacity:.7;}
+.fmo-grade-S{color:var(--dsw-alias-state-success-primary,#4caf50);}
+.fmo-grade-A{color:var(--dsw-alias-state-info-primary,#4c8dff);}
+.fmo-grade-B{color:var(--dsw-alias-state-warn-label,#e0a030);}
+.fmo-grade-C,.fmo-grade-?{color:var(--dsw-alias-label-tertiary,#999);}
 `
 
 /** Injected once, guarded by the plugin's own attribute, never removed. */
@@ -187,6 +262,7 @@ export function FreemodelsCard(): JSX.Element {
     void load()
   }, [load])
 
+  const [sortKey, setSortKey] = useState<SortKey>('capability')
   const selected = useMemo(() => new Set(status?.selected ?? []), [status?.selected])
   const models = status?.models ?? []
 
@@ -294,8 +370,36 @@ export function FreemodelsCard(): JSX.Element {
     }
   }, [status?.selected])
 
-  const rank = (model: ModelRow): number => (selected.has(model.id) ? 0 : 1)
-  const sorted = [...models].sort((a, b) => rank(a) - rank(b) || a.id.localeCompare(b.id))
+  /**
+   * List order, independent of what is ticked: unticking a model must not move
+   * the other rows, and the capability order has to match the order the model
+   * picker shows, which is also capability order. Every comparator ends in the
+   * id so equal rows never swap places between renders.
+   */
+  const sorted = useMemo(() => {
+    const rows = [...models]
+    // An unpublished window must not sort as if it were the fallback constant:
+    // sorting by context is a question about the real window, and a guess of
+    // 262144 would drop an unknown model into the middle of the list.
+    const windowOf = (model: ModelRow): number => (model.limitsKnown === false ? 0 : model.contextWindow)
+    if (sortKey === 'name') return rows.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id))
+    if (sortKey === 'context') {
+      return rows.sort(
+        (a, b) =>
+          windowOf(b) - windowOf(a) ||
+          b.maxTokens - a.maxTokens ||
+          rankOf(b).score - rankOf(a).score ||
+          a.id.localeCompare(b.id),
+      )
+    }
+    return rows.sort(
+      (a, b) =>
+        rankOf(b).score - rankOf(a).score ||
+        windowOf(b) - windowOf(a) ||
+        b.effortValues.length - a.effortValues.length ||
+        a.id.localeCompare(b.id),
+    )
+  }, [models, sortKey])
   const idle = busy === 'idle'
 
   return (
@@ -322,6 +426,28 @@ export function FreemodelsCard(): JSX.Element {
         {progress === '' ? null : <span className="fmo-note">{progress}</span>}
       </div>
 
+      <div className="fmo-sort" role="group" aria-label="列表排序方式">
+        <span className="fmo-sort-label">排序</span>
+        {(Object.keys(SORT_LABEL) as SortKey[]).map((key) => (
+          <button
+            type="button"
+            key={key}
+            className={key === sortKey ? 'fmo-chip fmo-chip-on' : 'fmo-chip'}
+            aria-pressed={key === sortKey}
+            title={
+              key === 'capability'
+                ? '按人工评级从高到低，评级相同时按上下文量排（和模型选择器里的顺序一致）'
+                : key === 'context'
+                  ? '按上下文量从大到小'
+                  : '按模型名称字母排'
+            }
+            onClick={() => setSortKey(key)}
+          >
+            {SORT_LABEL[key]}
+          </button>
+        ))}
+      </div>
+
       {error === '' ? null : <div className="fmo-error">{error}</div>}
       {note === '' ? null : <div className="fmo-note">{note}</div>}
 
@@ -346,6 +472,38 @@ export function FreemodelsCard(): JSX.Element {
                     {model.name === model.id ? model.id : `${model.name} · ${model.id}`}
                   </span>
                   {model.deprecated ? <span className="fmo-badge fmo-dim">已弃用</span> : null}
+                  {(() => {
+                    const rank = rankOf(model)
+                    return (
+                      <>
+                        <span
+                          className={`fmo-grade fmo-grade-${rank.grade}`}
+                          title={rank.note}
+                          aria-label={`能力评级 ${rank.grade}，${rank.score} 分`}
+                        >
+                          {rank.grade}
+                          <span className="fmo-grade-score">{rank.score}</span>
+                        </span>
+                        {/*
+                          * When upstream never described the model the two
+                          * numbers are the plugin's own fallback, so printing
+                          * them would be a made-up datasheet. Say so instead.
+                          */}
+                        <span
+                          className={`fmo-badge${model.limitsKnown === false ? ' fmo-dim' : ''}`}
+                          title={
+                            model.limitsKnown === false
+                              ? 'models.dev 没有这个模型的记录，上下文窗口与输出上限未知；点「刷新模型」可重试'
+                              : `上下文 ${model.contextWindow} tokens · 单次最多输出 ${model.maxTokens} tokens`
+                          }
+                        >
+                          {model.limitsKnown === false
+                            ? '上下文未知'
+                            : `上下文 ${compactTokens(model.contextWindow)} · 输出 ${compactTokens(model.maxTokens)}`}
+                        </span>
+                      </>
+                    )
+                  })()}
                   {model.reasoning ? (
                     <span
                       className="fmo-badge fmo-dim"
@@ -384,7 +542,11 @@ export function FreemodelsCard(): JSX.Element {
       </div>
 
       <div className="fmo-note">
-        勾选的模型会以 provider「opencode」出现在模型选择器里；一个都不勾就不显示任何模型。测试是真实的最小请求，会消耗一点免费额度。
+        勾选的模型会以 provider「opencode」出现在模型选择器里，顺序和上面「按能力」一致（最强的排最前）；一个都不勾就不显示任何模型。测试是真实的最小请求，会消耗一点免费额度。
+      </div>
+
+      <div className="fmo-note">
+        字母徽章是<strong>人工评级</strong>，不是跑分结果：这是对这批免费模型「干长活儿稳不稳」的手工判断，鼠标悬停可以看到每个模型的具体理由。想改顺序就编辑插件里的 <code>src/rank.ts</code>。
       </div>
 
       <div className="fmo-note">

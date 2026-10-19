@@ -59,6 +59,10 @@ bundle.apply({
 
 /* A scriptable bridge: every route answers from `state`, and records calls. */
 const state = {
+  // Deliberately NOT in rating order: `big-pickle` (B, 68) must render above
+  // `mimo-v2.6-flash-free` (A, 83), so the card cannot be passing this through.
+  // Three rows: the third one is what models.dev never described, and the card
+  // has to say "未知" for it rather than print the fallback constants.
   models: [
     {
       id: 'big-pickle',
@@ -70,6 +74,7 @@ const state = {
       maxTokens: 32768,
       reasoning: true,
       effortValues: ['none', 'low', 'high'],
+      rank: { score: 68, grade: 'B', source: 'table', note: '人工评级（不是跑分）· 上游既没声明档位也没公布家族信息。' },
     },
     {
       id: 'mimo-v2.6-flash-free',
@@ -81,6 +86,22 @@ const state = {
       maxTokens: 131072,
       reasoning: false,
       effortValues: [],
+      rank: { score: 83, grade: 'A', source: 'table', note: '人工评级（不是跑分）· 小米 MiMo V2.6，推理扎实。' },
+    },
+    {
+      // What a real catalogue looks like when models.dev was unreachable at
+      // refresh time: the fallback numbers are stored, flagged as unknown.
+      id: 'mystery-free',
+      name: 'Mystery Free',
+      freeLane: true,
+      deprecated: false,
+      image: false,
+      contextWindow: 262144,
+      maxTokens: 32768,
+      limitsKnown: false,
+      reasoning: false,
+      effortValues: [],
+      rank: { score: 60, grade: 'C', source: 'heuristic', note: '按 id 关键词估的（不是跑分）。' },
     },
   ],
   selected: [],
@@ -148,15 +169,76 @@ await flush()
 /* --------------------------------------------------------------- first load */
 if (!text().includes('opencode 免费模型')) throw new Error('the card did not render its title')
 if (!calls.some((call) => call.path.endsWith('/status'))) throw new Error('mounting did not fetch status')
-if (checkboxes().length !== 2) throw new Error(`expected 2 model rows, saw ${checkboxes().length}`)
+if (checkboxes().length !== 3) throw new Error(`expected 3 model rows, saw ${checkboxes().length}`)
 if (checkboxes().some((box) => box.checked)) throw new Error('nothing should start ticked')
 // Unticked rows still list (so they can be ticked) but the copy says so.
 if (!text().includes('一个都不勾')) throw new Error('the zero-tick explanation is missing')
 console.log(`  ok  first load lists ${checkboxes().length} models, none ticked`)
 
+/* ------------------------------------------------- ordering, badges, context */
+const rows = () => [...container.querySelectorAll('.fmo-row')]
+const gradeOf = (row) => row.querySelector('.fmo-grade')?.textContent ?? ''
+// Rows are addressed by id, never by position: the list is sorted, so the row
+// the user means is not the one at index 0.
+const rowFor = (id) => rows().find((row) => (row.textContent ?? '').includes(id))
+const tickIn = (id) => rowFor(id).querySelector('input[type="checkbox"]')
+
+const order = rows().map((row) => gradeOf(row))
+if (!(order[0]?.startsWith('A') === true && order[1]?.startsWith('B') === true && order[2]?.startsWith('C') === true)) {
+  throw new Error(`rows are not in capability order: ${order.join(' / ')}`)
+}
+// The rating explains itself on hover rather than asking to be trusted.
+if (!/人工评级/u.test(rows()[0].querySelector('.fmo-grade')?.getAttribute('title') ?? '')) {
+  throw new Error('the grade badge carries no explanation')
+}
+// The context size the user asked to see, in both directions and compacted.
+if (!text().includes('上下文 256K')) throw new Error('the 262144 context window was not rendered as 256K')
+if (!text().includes('输出 32K')) throw new Error('the max output was not rendered')
+if (!text().includes('上下文 1M')) throw new Error('the 1048576 context window was not rendered as 1M')
+// The row upstream never described must not borrow the fallback constants and
+// present them as a datasheet: it says the size is unknown, out loud.
+const mystery = rowFor('mystery-free')
+if (!(mystery?.textContent ?? '').includes('上下文未知')) {
+  throw new Error(`an unrated-window model printed a number: ${mystery?.textContent ?? '(no row)'}`)
+}
+if ((mystery?.textContent ?? '').includes('上下文 256K')) {
+  throw new Error('the fallback constant was printed as if models.dev had published it')
+}
+console.log('  ok  rows are ordered by rating, show their context size, and admit when it is unknown')
+
+/* ------------------------------------------------------- switching the sort */
+const sortChip = (label) => [...container.querySelectorAll('.fmo-chip')].find((node) => node.textContent?.trim() === label)
+for (const label of ['按能力', '按名称', '按上下文']) {
+  if (sortChip(label) === undefined) throw new Error(`the ${label} sort control is missing`)
+}
+await act(async () => {
+  sortChip('按上下文').click()
+})
+await flush()
+// Parse the badge back into a number, unit included: comparing "1" against
+// "256" because the M and the K were dropped would pass for the wrong reason.
+const tokenCount = (row) => {
+  const match = row.textContent.match(/上下文 ([\d.]+)([MK]?)/)
+  if (match === null) return 0
+  const scale = match[2] === 'M' ? 1_000_000 : match[2] === 'K' ? 1_000 : 1
+  return Number(match[1]) * scale
+}
+const contextOrder = rows().map(tokenCount)
+if (!(contextOrder[0] > contextOrder[1])) {
+  throw new Error(`按上下文 did not sort the window size down: ${contextOrder.join(' / ')}`)
+}
+await act(async () => {
+  sortChip('按能力').click()
+})
+await flush()
+if (!gradeOf(rows()[0]).startsWith('A')) {
+  throw new Error(`switching back to 按能力 did not restore the rating order: ${gradeOf(rows()[0])}`)
+}
+console.log('  ok  the sort switch re-orders the list and comes back')
+
 /* ----------------------------------------------------------------- ticking */
 await act(async () => {
-  checkboxes()[0].click()
+  tickIn('big-pickle').click()
 })
 await flush()
 const selectCall = calls.filter((call) => call.path.endsWith('/select')).at(-1)
@@ -167,7 +249,7 @@ if (JSON.stringify(selectCall.body.selected) !== JSON.stringify(['big-pickle']))
 console.log('  ok  a tick is written through /select')
 
 /* ------------------------------------------------------------------ probing */
-const rowButton = [...container.querySelectorAll('button')].find((node) => node.textContent?.trim() === '测试')
+const rowButton = [...rowFor('big-pickle').querySelectorAll('button')].find((node) => node.textContent?.trim() === '测试')
 if (rowButton === undefined) throw new Error('the per-row test button is missing')
 await act(async () => {
   rowButton.click()

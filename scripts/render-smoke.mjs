@@ -42,6 +42,8 @@ globalThis.fetch = async (url, init) => {
       ok: true,
       value: {
         models: [
+          // No `rank`: the card must cope with a catalogue written by an older
+          // build instead of rendering a blank badge or the word "undefined".
           { id: 'big-pickle', name: 'big-pickle', freeLane: true, deprecated: false, image: false, contextWindow: 262144, maxTokens: 32768 },
           { id: 'mimo-v2.6-flash-free', name: 'MiMo', freeLane: true, deprecated: false, image: true, contextWindow: 1048576, maxTokens: 131072 },
         ],

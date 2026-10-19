@@ -89,7 +89,7 @@ export function apply(ctx: unknown, config: PluginConfig = {}): void {
       const { stale } = await store.load()
       publish()
       if (store.state.models.length === 0 || stale) {
-        const result = await refreshCatalog({ baseUrl })
+        const result = await refreshCatalog({ baseUrl, previous: store.state.models })
         await store.replaceCatalog(result.models, result.fetchedAt)
         publish()
         log(ctx, 'info', `dsh-freemodels-opencode: loaded ${result.models.length} models`)
