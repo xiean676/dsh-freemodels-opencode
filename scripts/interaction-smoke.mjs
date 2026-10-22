@@ -112,6 +112,20 @@ const state = {
 const calls = []
 let failNext = false
 let exhaustNext = false
+
+/**
+ * The bridge answers `/probe` with NDJSON, one line per model. The fake has to
+ * speak the same wire format, so it returns a real Response with a readable
+ * body instead of a `json()` stub.
+ */
+const jsonReply = (value, status = 200) =>
+  new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } })
+const ndjsonReply = (lines) =>
+  new Response(
+    `${lines.map((line) => JSON.stringify(line)).join('\n')}\n`,
+    { status: 200, headers: { 'content-type': 'application/x-ndjson; charset=utf-8' } },
+  )
+
 globalThis.fetch = async (url, init) => {
   const path = String(url)
   const method = init?.method ?? 'GET'
@@ -119,33 +133,40 @@ globalThis.fetch = async (url, init) => {
   calls.push({ path, method, body })
   if (failNext) {
     failNext = false
-    return { ok: false, status: 500, json: async () => ({ ok: false, error: 'boom' }) }
+    return jsonReply({ ok: false, error: 'boom' }, 500)
   }
-  const reply = (value) => ({ ok: true, status: 200, json: async () => ({ ok: true, value }) })
-  if (path.endsWith('/status')) return reply({ ...state })
+  if (path.endsWith('/status')) return jsonReply({ ok: true, value: { ...state } })
   if (path.endsWith('/refresh')) {
     state.lastRefresh = '2026-10-17T18:00:00.000Z'
     // The real route answers with the full catalogue, not a count.
-    return reply({ models: state.models, selected: state.selected, lastRefresh: state.lastRefresh, warning: null })
+    return jsonReply({
+      ok: true,
+      value: { models: state.models, selected: state.selected, lastRefresh: state.lastRefresh, warning: null },
+    })
   }
   if (path.endsWith('/select')) {
     state.selected = body.selected
-    return reply({ selected: state.selected })
+    return jsonReply({ ok: true, value: { selected: state.selected } })
   }
   if (path.endsWith('/probe')) {
+    const results = []
     if (body.scope === 'one') {
-      return reply({
-        results: [{ id: body.id, verdict: 'rate_limited', detail: 'Rate limit exceeded.', ms: 900, retryAfterMs: 42000 }],
-      })
-    }
-    if (exhaustNext) {
+      results.push({ id: body.id, verdict: 'rate_limited', detail: 'Rate limit exceeded.', ms: 900, retryAfterMs: 42000 })
+    } else if (exhaustNext) {
       // The host stops a sweep on a verdict that cannot vary by model, so the
       // answer is a partial list — the card must say why, not just show a count.
-      return reply({ results: [{ id: state.selected[0], verdict: 'exhausted', detail: 'free tier refused', ms: 400 }] })
+      results.push({ id: state.selected[0], verdict: 'exhausted', detail: 'free tier refused', ms: 400 })
+    } else {
+      for (const id of state.selected) {
+        results.push({ id, verdict: 'available', detail: 'upstream answered', ms: 1200 })
+      }
     }
-    return reply({ results: state.selected.map((id) => ({ id, verdict: 'available', detail: 'upstream answered', ms: 1200 })) })
+    return ndjsonReply([
+      ...results.map((value) => ({ type: 'result', value })),
+      { type: 'done', value: { ok: true } },
+    ])
   }
-  return { ok: false, status: 404, json: async () => ({ ok: false, error: `no route ${path}` }) }
+  return jsonReply({ ok: false, error: `no route ${path}` }, 404)
 }
 
 const container = document.getElementById('root')
@@ -270,6 +291,17 @@ await act(async () => {
   button('测试已勾选').click()
 })
 await flush()
+// The first click only asks: a sweep of N models is N real requests against a
+// shared free bucket, and the user was rate-limited into an IP ban by probing
+// too much. Nothing may be sent until the second click confirms.
+if (calls.some((call) => call.path.endsWith('/probe') && call.body?.scope === 'selected')) {
+  throw new Error('the bulk test spent quota on its first click')
+}
+if (!text().includes('确认测试')) throw new Error(`the confirmation was not asked for: ${text().slice(0, 300)}`)
+await act(async () => {
+  button('确认测试').click()
+})
+await flush()
 exhaustNext = false
 if (!text().includes('车道额度用尽')) throw new Error('the exhausted verdict never rendered')
 if (!text().includes('就停了')) throw new Error(`a truncated sweep was not explained: ${text().slice(0, 400)}`)
@@ -291,6 +323,10 @@ await act(async () => {
   bulkButton.click()
 })
 await flush()
+await act(async () => {
+  button('确认测试').click()
+})
+await flush()
 const bulkCall = calls.filter((call) => call.path.endsWith('/probe')).at(-1)
 if (bulkCall?.body?.scope !== 'selected') throw new Error(`bulk test sent ${JSON.stringify(bulkCall?.body)}`)
 if (!text().includes('可用')) throw new Error('the bulk verdict never landed')
@@ -306,5 +342,16 @@ if (!text().includes('失败') && !text().includes('读不到')) {
   throw new Error(`a failed refresh showed nothing: ${text().slice(0, 300)}`)
 }
 console.log('  ok  a failed refresh is reported, not swallowed')
+
+/* ------------------------------------------------------------------ unmount */
+await act(async () => {
+  reactRoot.unmount()
+})
+await flush()
+// Unmounting must stop the card's own timers: a background poll that keeps
+// running after the card is gone would keep hitting the bridge for nobody.
+const callsAfterUnmount = calls.length
+await new Promise((resolve) => setTimeout(resolve, 50))
+if (calls.length !== callsAfterUnmount) throw new Error('the card kept calling the bridge after unmount')
 
 console.log(`  ok  ${calls.length} bridge calls, no crash across the whole flow`)

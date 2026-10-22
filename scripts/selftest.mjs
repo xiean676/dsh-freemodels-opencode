@@ -76,12 +76,60 @@ async function call(route, { method = 'GET', body, raw, headers = {} } = {}) {
     setHeader(key, value) {
       captured.headers[key.toLowerCase()] = String(value)
     },
+    write(chunk) {
+      captured.text += String(chunk)
+    },
     end(text) {
-      captured.text = text ?? ''
+      captured.text += text ?? ''
     },
   }
   await route.handler(request, response)
   return { ...captured, json: captured.text === '' ? undefined : JSON.parse(captured.text) }
+}
+
+/**
+ * Invoke one bridge route and read its NDJSON answer line by line.
+ *
+ * `/probe` streams one verdict per model instead of one JSON document at the
+ * end: a sweep of nine models can outlast the host's 300 s request budget, and
+ * a single JSON answer would then be lost entirely.
+ */
+async function callStream(route, { method = 'POST', body } = {}) {
+  const payload = body === undefined ? [] : [Buffer.from(JSON.stringify(body))]
+  const request = {
+    method,
+    headers: { host: '127.0.0.1:51441' },
+    socket: { remoteAddress: '127.0.0.1' },
+    async *[Symbol.asyncIterator]() {
+      for (const chunk of payload) yield chunk
+    },
+  }
+  const captured = { status: 0, headers: {}, text: '' }
+  const response = {
+    set statusCode(value) {
+      captured.status = value
+    },
+    setHeader(key, value) {
+      captured.headers[key.toLowerCase()] = String(value)
+    },
+    write(chunk) {
+      captured.text += String(chunk)
+    },
+    end(text) {
+      captured.text += text ?? ''
+    },
+  }
+  await route.handler(request, response)
+  const lines = captured.text
+    .split('\n')
+    .filter((line) => line.trim() !== '')
+    .map((line) => JSON.parse(line))
+  return {
+    ...captured,
+    lines,
+    results: lines.filter((line) => line.type === 'result').map((line) => line.value),
+    done: lines.find((line) => line.type === 'done')?.value,
+  }
 }
 
 /* ------------------------------------------------------------------ tests */
@@ -214,9 +262,11 @@ await step('rank: hand table, heuristic ceiling, total and stable capability ord
     ['space-bunny-free', 'S'],
     ['deepseek-v4.1-flash-free', 'S'],
     ['glm-5.3-flash-free', 'A'],
+    ['minimax-m3.1-flash-free', 'A'],
     ['nemotron-3.5-super-vl-free', 'A'],
     ['longcat-2.5-preview-free', 'B'],
     ['big-pickle', 'B'],
+    ['flint-40b-free', 'B'],
     ['nemotron-3.5-lightning-free', 'C'],
     ['beam-free', 'C'],
   ]
@@ -236,6 +286,15 @@ await step('rank: hand table, heuristic ceiling, total and stable capability ord
 
   // The version number nudges, and does not escape the ceiling.
   assert.ok(rankModel({ id: 'gemini-v9.9-thing' }).score >= rankModel({ id: 'gemini-v1.0-thing' }).score)
+
+  // A tier word is a word, not a substring: "minimax" must not read as "max",
+  // and "flash" must still count when it stands on its own.
+  assert.equal(rankModel({ id: 'max-thing' }).score, HEURISTIC_CEILING, '"max" is a tier word')
+  assert.equal(rankModel({ id: 'minimax-thing' }).score, 60, '"minimax" is not the tier word "max"')
+  assert.ok(
+    rankModel({ id: 'minimax-flash-thing' }).score < rankModel({ id: 'minimax-thing' }).score,
+    '"flash" is still a tier word when it stands on its own',
+  )
 
   // Order is total: no two distinct entries compare as equal, and reversing the
   // input cannot change the answer — otherwise rows would swap between renders.
@@ -395,6 +454,13 @@ await step('probe classification matches the measured upstream shapes', async ()
     [401, '{"type":"error","error":{"type":"AuthError","message":"Missing API key."}}', 'paid'],
     [400, '{"error":{"type":"server_error","message":"Upstream request failed: Model is unavailable."}}', 'unavailable'],
     [429, '{"error":{"type":"server_error","message":"Upstream request failed: Endpoint is unavailable."}}', 'unavailable'],
+    // The gateway itself fell over. That is not a property of the model, so it
+    // gets its own retryable verdict instead of hiding behind "未测出".
+    [
+      500,
+      '{"error":{"type":"server_error","message":"Upstream request failed: Endpoint is unavailable."}}',
+      'upstream_error',
+    ],
     // A geo-block is also a 403, but it must never read as "needs a paid plan".
     [403, '{"type":"error","error":{"type":"RegionError","message":"This model is not available in your country"}}', 'region'],
     // Served, but not over the chat-completions protocol this lane speaks.
@@ -416,9 +482,12 @@ await step('probe classification matches the measured upstream shapes', async ()
 
   // The probe must ask for a real answer, not a single token: a nearly-spent
   // window happily answers `ping` and then 429s the user's first real turn.
+  // It must also stay small: every probe spends the shared free bucket, and a
+  // long answer costs the lane quota the user has to live on.
   const body = JSON.parse(probeBody('big-pickle'))
   assert.equal(body.max_tokens, REALISTIC_MAX_TOKENS)
-  assert.ok(REALISTIC_MAX_TOKENS >= 256, 'a probe must request enough output to be representative')
+  assert.ok(REALISTIC_MAX_TOKENS >= 64, 'a probe must request enough output to be representative')
+  assert.ok(REALISTIC_MAX_TOKENS <= 256, 'a probe must not burn the free lane on a long answer')
 
   assert.equal(parseRetryAfter('5'), 5000)
   assert.equal(parseRetryAfter('74585'), 74_585_000)
@@ -450,7 +519,7 @@ await step('probe never throws and reports a timeout as unknown, not unavailable
     })
   const result = await probeModel('big-pickle', { fetchImpl: hanging, timeoutMs: 30 })
   assert.equal(result.verdict, 'unknown')
-  assert.match(result.detail, /没有响应/u)
+  assert.match(result.detail, /没有等到有效内容/u)
 
   const good = await probeModel('big-pickle', { fetchImpl: fakeFetch(() => ({ body: sseBody() })) })
   assert.equal(good.verdict, 'available')
@@ -599,6 +668,14 @@ await step('bridge: guard, methods, refresh, select, probe scopes', async () => 
     assert.equal(refreshed.json.ok, true, JSON.stringify(refreshed.json))
     assert.equal(refreshed.json.value.models.length, 2)
 
+    // The quick refresh answers with the id list and says so; the metadata is
+    // filled in afterwards, because models.dev takes 6–116 s on this link and
+    // the user only needs to know which models exist.
+    const quick = await call(at('refresh'), { method: 'POST', body: { mode: 'quick' } })
+    assert.equal(quick.json.ok, true, JSON.stringify(quick.json))
+    assert.equal(quick.json.value.models.length, 2)
+    assert.match(quick.json.value.warning ?? '', /后台补全/u, 'the quick refresh says the metadata is still coming')
+
     const bad = await call(at('select'), { method: 'POST', body: { selected: 'nope' } })
     assert.equal(bad.json.ok, false)
     assert.equal(bad.json.code, 'settings-rejected')
@@ -614,23 +691,41 @@ await step('bridge: guard, methods, refresh, select, probe scopes', async () => 
       'a hand-written catalogue literal is still given a usable rating',
     )
 
-    const one = await call(at('probe'), { method: 'POST', body: { scope: 'one', id: 'm-good-free' } })
-    assert.equal(one.json.value.results[0].verdict, 'available')
+    const one = await callStream(at('probe'), { method: 'POST', body: { scope: 'one', id: 'm-good-free' } })
+    assert.equal(one.status, 200)
+    assert.equal(one.headers['content-type'], 'application/x-ndjson; charset=utf-8')
+    assert.deepEqual(one.results.map((result) => [result.id, result.verdict]), [['m-good-free', 'available']])
+    assert.equal(one.done.ok, true, 'the stream ends with a done marker')
+
+    // The same model again inside the window must not spend a second call: the
+    // lane meters one shared bucket and the user was banned for draining it.
+    probes.length = 0
+    const again = await callStream(at('probe'), { method: 'POST', body: { scope: 'one', id: 'm-good-free' } })
+    assert.deepEqual(again.results.map((result) => [result.id, result.verdict]), [['m-good-free', 'skipped']])
+    assert.deepEqual(probes, [], 'the throttled model was answered from memory')
 
     // A sweep stops at the first auth refusal: every later probe would fail the
     // same way, so spending calls to learn that again is waste.
     probes.length = 0
-    const sweep = await call(at('probe'), { method: 'POST', body: { scope: 'selected' } })
+    const sweep = await callStream(at('probe'), { method: 'POST', body: { scope: 'selected' } })
     assert.deepEqual(
-      sweep.json.value.results.map((result) => [result.id, result.verdict]),
+      sweep.results.map((result) => [result.id, result.verdict]),
       [['m-looks-free', 'paid']],
       'the sweep stopped after the paid verdict',
     )
     assert.deepEqual(probes, ['m-looks-free'], 'only one upstream call was spent')
 
-    const badScope = await call(at('probe'), { method: 'POST', body: { scope: 'nope' } })
-    assert.equal(badScope.json.ok, false)
-    assert.match(badScope.json.message, /scope must be/u)
+    // A throttled model inside a sweep is reported, not silently retested.
+    await store.setSelected(['m-good-free'])
+    probes.length = 0
+    const throttledSweep = await callStream(at('probe'), { method: 'POST', body: { scope: 'selected' } })
+    assert.deepEqual(throttledSweep.results.map((result) => [result.id, result.verdict]), [['m-good-free', 'skipped']])
+    assert.deepEqual(probes, [], 'the sweep skipped the model it had just measured')
+    await store.setSelected(['m-looks-free', 'm-good-free'])
+
+    const badScope = await callStream(at('probe'), { method: 'POST', body: { scope: 'nope' } })
+    assert.equal(badScope.done.ok, false)
+    assert.match(badScope.done.message, /scope must be/u)
 
     // `exhausted` is the other sweep-terminating verdict: the lane refused this
     // client outright, so every remaining model would answer identically.
@@ -661,21 +756,21 @@ await step('bridge: guard, methods, refresh, select, probe scopes', async () => 
     for (const route of makeRoutes({ store, publish: () => {}, fetchImpl: countingFetch })) {
       exhaustedRoutes.set(route.path, route)
     }
-    const exhaustedSweep = await call(exhaustedRoutes.get('/plugins/dsh-freemodels-opencode/probe'), {
+    const exhaustedSweep = await callStream(exhaustedRoutes.get('/plugins/dsh-freemodels-opencode/probe'), {
       method: 'POST',
       body: { scope: 'selected' },
     })
     assert.deepEqual(
-      exhaustedSweep.json.value.results.map((result) => [result.id, result.verdict]),
+      exhaustedSweep.results.map((result) => [result.id, result.verdict]),
       [['m-looks-free', 'exhausted']],
       'the sweep stopped after the lane refused the client',
     )
     assert.deepEqual(refusals, ['m-looks-free'], 'only one upstream call was spent')
 
     // An empty body is fine (`{}`); only unparseable JSON is a 400.
-    const empty = await call(at('probe'), { method: 'POST' })
+    const empty = await callStream(at('probe'), { method: 'POST' })
     assert.equal(empty.status, 200)
-    assert.equal(empty.json.ok, false, 'an empty body has no scope')
+    assert.equal(empty.done.ok, false, 'an empty body has no scope')
 
     const unreadable = await call(at('probe'), { method: 'POST', raw: 'not json' })
     assert.equal(unreadable.status, 400)

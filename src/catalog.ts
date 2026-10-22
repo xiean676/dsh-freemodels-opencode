@@ -13,6 +13,7 @@
  * are dropped here rather than hidden in the UI, so a priced id can never reach
  * the picker, the probe queue, the state file or the harness catalogue.
  */
+import { describeNetworkError } from './net-errors.ts'
 import { rankModel, type ModelRank } from './rank.ts'
 import { disguiseHeaders, probeRequestIDs } from './zen-ids.ts'
 
@@ -25,7 +26,20 @@ const MODELS_DEV_URL = 'https://models.dev/api.json'
  * start without leaving the user staring at a spinner forever.
  */
 const MODELS_DEV_TIMEOUT_MS = 90_000
-const FETCH_TIMEOUT_MS = 30_000
+/**
+ * Budget for the model-list request.
+ *
+ * Measured on this machine: the Zen list answers in 0.4–3 s when it answers at
+ * all, but the *DNS layer* intermittently times out (node's `resolve4` on
+ * opencode.ai times out where the .NET resolver succeeds 8/8 — the same
+ * machine, the same moment). A 30 s budget turned that hiccup into a hard
+ * failure, and the failure was reported to the user as a bare "fetch failed".
+ * 45 s plus one retry covers the hiccup, and the error now says what actually
+ * went wrong.
+ */
+const FETCH_TIMEOUT_MS = 45_000
+/** Pause before the second attempt, so a retry is not the same packet storm. */
+const RETRY_BACKOFF_MS = 1_500
 
 export const DEFAULT_CONTEXT_WINDOW = 262_144
 export const DEFAULT_MAX_TOKENS = 32_768
@@ -110,29 +124,63 @@ export interface CatalogOptions {
    * time inherit these values instead of being reset to the fallback constants.
    */
   previous?: readonly ModelMeta[]
+  /**
+   * Skip models.dev entirely and return the id list only.
+   *
+   * The id list is what the card needs to show the right models; the metadata
+   * is what makes the windows and effort ladders honest. Fetching the 5.8 MB
+   * document takes 6–116 s on this connection, so a user who only wants the
+   * list should not wait for it: the quick path answers in under a second and
+   * the metadata is filled in afterwards.
+   */
+  skipMetadata?: boolean
 }
 
-/** `{"object":"list","data":[{"id":"big-pickle", ...}]}` → ids, order preserved. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * `{"object":"list","data":[{"id":"big-pickle", ...}]}` → ids, order preserved.
+ *
+ * One retry, because the only observed failure of this endpoint is a
+ * transient DNS/TLS hiccup and the id list is the one request the whole
+ * catalogue depends on. The second attempt is separated by a short pause so a
+ * broken resolver gets a moment to recover instead of being hit twice in a
+ * row.
+ */
 export async function fetchZenModels(options: CatalogOptions = {}): Promise<string[]> {
   const fetchImpl = options.fetchImpl ?? fetch
   const baseUrl = options.baseUrl ?? ZEN_BASE_URL
-  const response = await fetchImpl(`${baseUrl}/v1/models`, {
-    headers: { authorization: 'Bearer public', accept: 'application/json', ...disguiseHeaders(probeRequestIDs('catalog')) },
-    signal: withTimeout(),
-  })
-  if (!response.ok) throw new Error(`the model list endpoint answered HTTP ${response.status}`)
-  const payload = asRecord(await response.json())
-  const rows = Array.isArray(payload?.data) ? payload.data : []
-  const ids: string[] = []
-  const seen = new Set<string>()
-  for (const row of rows) {
-    const id = asRecord(row)?.id
-    if (typeof id !== 'string' || id.length === 0 || seen.has(id)) continue
-    seen.add(id)
-    ids.push(id)
+  let lastError: unknown
+  for (const attempt of [1, 2]) {
+    try {
+      const response = await fetchImpl(`${baseUrl}/v1/models`, {
+        headers: { authorization: 'Bearer public', accept: 'application/json', ...disguiseHeaders(probeRequestIDs('catalog')) },
+        signal: withTimeout(),
+      })
+      if (!response.ok) throw new Error(`the model list endpoint answered HTTP ${response.status}`)
+      const payload = asRecord(await response.json())
+      const rows = Array.isArray(payload?.data) ? payload.data : []
+      const ids: string[] = []
+      const seen = new Set<string>()
+      for (const row of rows) {
+        const id = asRecord(row)?.id
+        if (typeof id !== 'string' || id.length === 0 || seen.has(id)) continue
+        seen.add(id)
+        ids.push(id)
+      }
+      if (ids.length === 0) throw new Error('the model list endpoint returned no models')
+      return ids
+    } catch (error) {
+      lastError = error
+      if (attempt === 1) {
+        await sleep(RETRY_BACKOFF_MS)
+        continue
+      }
+    }
   }
-  if (ids.length === 0) throw new Error('the model list endpoint returned no models')
-  return ids
+  throw new Error(describeNetworkError(lastError))
 }
 
 function providerRank(id: string, name: string): number {
@@ -252,7 +300,7 @@ export async function fetchModelsDev(fetchImpl: typeof fetch = fetch): Promise<M
       if (attempt === 1) continue
     }
   }
-  throw lastError instanceof Error ? lastError : new Error(String(lastError))
+  throw new Error(describeNetworkError(lastError))
 }
 /**
  * Heuristic pre-filter only — the probe is the only authority on reachability.
@@ -342,8 +390,39 @@ export interface RefreshResult {
   warning?: string
 }
 
+/**
+ * Rebuild the catalogue.
+ *
+ * Two shapes:
+ *   - full: the id list from Zen plus the metadata from models.dev.
+ *   - quick (`skipMetadata`): the id list only. The 5.8 MB metadata document
+ *     takes 6–116 s on this connection, and the id list is what the card
+ *     actually needs to show the right models; the metadata is filled in
+ *     afterwards, in the background.
+ *
+ * A failed Zen list is fatal for the refresh — without the ids there is no
+ * catalogue. A failed models.dev is not: the cached windows and ladders are
+ * carried over, and the card is told that they are carried over.
+ */
 export async function refreshCatalog(options: CatalogOptions = {}): Promise<RefreshResult> {
   const fetchImpl = options.fetchImpl ?? fetch
+  const previous = options.previous ?? []
+
+  if (options.skipMetadata === true) {
+    const ids = await fetchZenModels({
+      fetchImpl,
+      ...(options.baseUrl === undefined ? {} : { baseUrl: options.baseUrl }),
+    })
+    const models = mergeCatalog(ids, new Map(), previous)
+    return {
+      models,
+      fetchedAt: new Date().toISOString(),
+      enriched: false,
+      complete: false,
+      warning: '已拉取模型清单，models.dev 元数据在后台补全（上下文窗口和推理档位稍后更新）。',
+    }
+  }
+
   const [zen, dev] = await Promise.allSettled([
     fetchZenModels({ fetchImpl, ...(options.baseUrl === undefined ? {} : { baseUrl: options.baseUrl }) }),
     fetchModelsDev(fetchImpl),
@@ -352,7 +431,7 @@ export async function refreshCatalog(options: CatalogOptions = {}): Promise<Refr
     throw zen.reason instanceof Error ? zen.reason : new Error(String(zen.reason))
   }
   const enriched = dev.status === 'fulfilled'
-  const models = mergeCatalog(zen.value, enriched ? dev.value : new Map(), options.previous ?? [])
+  const models = mergeCatalog(zen.value, enriched ? dev.value : new Map(), previous)
   // A partial answer is still worth publishing (the id list itself may have
   // changed), but it must not be treated as a fresh description of every model.
   const complete = enriched && models.every((model) => model.limitsKnown)
@@ -362,7 +441,7 @@ export async function refreshCatalog(options: CatalogOptions = {}): Promise<Refr
     enriched,
     complete,
     ...(dev.status === 'rejected'
-      ? { warning: `models.dev 元数据这次没拉到（${dev.reason instanceof Error ? dev.reason.message : String(dev.reason)}）：清单已更新，但沿用上次的上下文窗口和推理档位，不会清空。` }
+      ? { warning: `models.dev 元数据这次没拉到（${describeNetworkError(dev.reason)}）：清单已更新，但沿用上次的上下文窗口和推理档位，不会清空。` }
       : {}),
   }
 }

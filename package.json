@@ -2,7 +2,7 @@
   "name": "dsh-freemodels-opencode",
   "displayName": "DSH Free Models · opencode",
   "description": "把 opencode Zen 免费车道的模型接入 DeepSeek Harness：可刷新模型清单、勾选要用的模型、一键测试每个模型能不能用。零勾选时列表不显示任何模型。",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": "xiean676",
   "license": "MIT",
   "keywords": [

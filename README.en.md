@@ -13,7 +13,7 @@ This is an independent project. It does **not** modify or depend on [`@opencode2
 
 ## Why
 
-`https://opencode.ai/zen/v1/models` currently returns 85 model ids, 76 of them paid. This plugin **drops the paid ones at fetch time** and keeps the 9 free-lane models currently on the lane, so no paid id ever reaches the card, the probe queue, or the state file.
+`https://opencode.ai/zen/v1/models` currently returns 86 model ids, most of them paid. This plugin **drops the paid ones at fetch time** and keeps the 9 free-lane models currently on the lane, so no paid id ever reaches the card, the probe queue, or the state file.
 
 "Free lane" is not just the `-free` suffix: `big-pickle` has no suffix yet sits on the lane, and a few suffixed ids are blocklisted.
 
@@ -41,8 +41,10 @@ Restart Harness, open **Settings → Models**, and scroll to the bottom.
 
 1. **刷新模型 / Refresh** — pull the list (also happens automatically on first load). Only free models are listed.
 2. Tick what you want. Only ticked models reach the model picker.
-3. **测试** on a row — one full-size request (512-token ceiling, not a ping), verdict in a few hundred milliseconds.
+3. **测试** on a row — one full-size request (96-token ceiling, not a ping), verdict in a few hundred milliseconds to a few tens of seconds. **The verdict lands as soon as upstream sends any content** — the plugin does not wait for the whole stream to drain.
 4. **测试已勾选（N）** — probes the ticked set serially. It stops at `paid`, at `exhausted`, or at a `rate_limited` carrying a `retry-after` longer than 5 minutes: those three cannot vary by model, so continuing would only spend the window you are waiting out.
+   - The bulk button **asks once first** (it becomes "确认测试 N 个模型？"), because it really sends N requests and spends N shares of the free quota.
+   - The same model is **never probed twice within 60 seconds**; a repeat click just reports "刚测过" and sends nothing.
 
 > Free-lane detection is a heuristic (blocklist → known-good list → zero price on models.dev → `free` in the id). If a newly launched free model is missing, or a paid one slipped in, press **刷新模型** to re-decide; the rule lives in `isFreeLane` in `src/catalog.ts`.
 
@@ -58,7 +60,11 @@ Three sort buttons sit above the list; **按能力 / by capability** is the defa
 
 The **S/A/B/C badge is a hand rating, not a benchmark.** It is one person's judgement of "how steady is this model on long working turns", banded S (90+), A (80+), B (70+), C. Hovering the badge shows the reason for that specific model. To retune the order, edit `src/rank.ts` — scores and reasons both live there, and nothing else needs to know.
 
-An id nobody has rated yet is scored by a keyword heuristic (version number in the id, plus tier words like `flash` / `preview`) and **capped below every hand rating** (61), so a model that appears upstream tomorrow lands at the bottom of the list instead of displacing a rating someone wrote on purpose.
+An id nobody has rated yet is scored by a keyword heuristic (version number in the id, plus tier words like `flash` / `preview`) and **capped below every hand rating** (63), so a model that appears upstream tomorrow lands at the bottom of the list instead of displacing a rating someone wrote on purpose.
+
+The heuristic matches **whole words** after splitting the id on `-` / `_` / `.`. An earlier version matched substrings, so the `max` inside `minimax-m3.1-flash-free` scored as a high tier and broke the loop before `flash` could subtract. `minimax` no longer hits `max`, and `flash` now deducts as intended.
+
+The upstream list moves: `space-bunny-free` and `longcat-2.5-preview-free` were withdrawn upstream in 2026-10, but the hand table **keeps** their entries (96 / 74). If upstream restores them, the plugin puts them straight back where they were.
 
 K/M suffixes follow the divisor the number implies: powers of two convert in binary (262144 → 256K), hand-written integers convert in decimal (200000 → 200K). Both kinds of upstream figure land on what the datasheet says.
 
@@ -72,9 +78,13 @@ K/M suffixes follow the divisor the number implies: powers of two convert in bin
 | 需付费 / paid | 401/403 `AuthError`: no anonymous credential for this model | Pick a free-lane model |
 | 区域受限 / region | 403 `RegionError`: exists, but not for your egress country | Change egress |
 | 上游不提供 / unavailable | 400: unknown id, or not served over chat-completions | Don't pick it |
-| 未测出 / unknown | Timeout, 5xx, empty body | Retest; **not** proof of breakage |
+| 上游临时故障 / upstream error | 5xx `Upstream request failed`: the upstream gateway itself dropped the request | **Nothing to do with this model** — retest later |
+| 刚测过 / skipped | Probed within the last 60 seconds; no request was sent | Wait a minute if you want a fresh one |
+| 未测出 / unknown | Timeout, empty body | Retest; **not** proof of breakage |
 
-Separating "rate limited" from "available" costs something: the probe is a real 60-integer task with a 512-token ceiling, not a 16-token ping. A tiny request only proves the bucket was non-empty at that instant, which is exactly how you get "probes green, first real message 429". Now "available" means this path just completed a full answer.
+"Upstream error" is a verdict of its own on purpose: an upstream 5xx says the gateway did not catch the request, which says nothing about whether the model works. Folding it into "unknown" makes people conclude the model is broken.
+
+Separating "rate limited" from "available" costs something: the probe is a real 30-integer task with a 96-token ceiling, not a 16-token ping. A tiny request only proves the bucket was non-empty at that instant, which is exactly how you get "probes green, first real message 429". Now "available" means this path just completed a full answer.
 
 Verdicts stay in memory only. Rate limits expire — persisting "unavailable" to disk would keep lying long after upstream changed its mind.
 
@@ -89,6 +99,10 @@ The plugin reads those declarations from models.dev into the catalogue and hands
 If a model still offers no levels in DSH: press **刷新模型** to re-pull the metadata, then restart DSH. Levels come from the catalogue; an unrefreshed catalogue never reaches the picker.
 
 models.dev is a 5.8 MB document that measured around 15 s and times out often, so the budget is 90 s with one retry. **If it still fails, models keep the effort ladders and windows the last successful fetch brought in** rather than being blanked — one failed request should not cost you the whole effort selector.
+
+**Refreshing happens in two steps**: pressing **刷新模型** pulls only the Zen list (usually back within a second), and the models.dev metadata is filled in in the background; the card picks it up on its own at 15 s, 60 s and 150 s. That 5.8 MB document can be as slow as it likes without leaving you staring at a spinner.
+
+The Zen fetch can fail on its own — this machine's node resolver intermittently times out on `opencode.ai` (the `.NET` resolver never does), so it now gets one retry with a 1.5 s backoff and a 45 s budget. When it does fail, the card says what actually went wrong (name resolution failed / connection reset / TLS negotiation failed / certificate check failed / request timed out) instead of showing a bare `fetch failed`.
 
 ### What "上下文未知" means
 
@@ -138,10 +152,11 @@ Unset, it skips instead of failing.
 | `src/zen-ids.ts` | The `ses_*` session id and seven disguise headers the free lane demands |
 | `src/rank.ts` | The hand rating table and capability order (**the only file to touch to retune it**) |
 | `src/catalog.ts` | Zen model list + models.dev metadata; **paid models dropped** before the merge into `ModelMeta[]` |
-| `src/probe.ts` | Single-model probe and the seven-way verdict classifier (never throws) |
+| `src/probe.ts` | Single-model probe and the nine-way verdict classifier (never throws, classifies mid-stream) |
+| `src/net-errors.ts` | Turns `fetch failed` into human words: DNS failure / connection reset / TLS / certificate / timeout |
 | `src/store.ts` | `$DSH_HOME/data/dsh-freemodels-opencode/state.json`, serial, atomic replace |
 | `src/adapter.ts` | The `LlmAdapter` for provider `opencode`; advertises only the ticked set |
-| `src/bridge.ts` | Four same-origin routes: `/status` `/refresh` `/select` `/probe` |
+| `src/bridge.ts` | Four same-origin routes: `/status` `/refresh` `/select` `/probe` (probes stream back as NDJSON) |
 | `src/index.ts` | Host entry: register the adapter, seed the catalogue, mount the routes |
 | `src/client/` | Browser entry + card (requires only `react`) |
 
@@ -156,6 +171,18 @@ MIT. The protocol work in `src/zen-ids.ts`, the free-lane gate, the models.dev d
 Upstream services are operated by OpenCode and are not affiliated with this project.
 
 ## Changelog
+
+### v0.3.0
+
+- **Two hand ratings added**: `minimax-m3.1-flash-free` at 87 (band A — 1M context, 512K output, full effort ladder; held one notch down because a fresh launch is unproven) and `flint-40b-free` at 71 (bottom of band B). The withdrawn-but-kept `space-bunny-free` / `longcat-2.5-preview-free` entries now carry a note saying why.
+- **Fixed a substring bug in the heuristic**: tier words are matched as whole words after splitting on `-` / `_` / `.`. The `max` inside `minimax` no longer scores as a high tier, and `flash` is no longer skipped by the break. The heuristic ceiling went 61 → 63, still strictly below the lowest hand rating of 64.
+- **Refreshing is now two steps**: **刷新模型** pulls only the Zen list (fast), models.dev metadata is filled in in the background, and the card follows up on its own. The Zen fetch gets one retry with a backoff and a 45 s budget.
+- **Network errors say what they are**: new `src/net-errors.ts` splits `fetch failed` into name-resolution failure / connection reset / TLS negotiation failure / certificate check failure / request timeout, with the error code attached.
+- **Probes classify mid-stream**: the verdict lands as soon as upstream produces any content, instead of after the whole body drains. The probe budget went 30 s → 90 s. Slow models (one measured its first content at 29.8 s) are no longer misreported as "unknown".
+- **Two new verdicts**: "上游临时故障" (an upstream 5xx, nothing to do with the model) and "刚测过" (probed within 60 seconds, no request sent).
+- **`/probe` streams back as NDJSON**, so the card renders as results arrive and a serial run over nine models can no longer be cut off by the host's 300 s request timeout.
+- **Cheaper probes**: the ceiling went 512 → 96 tokens and the task from "count to 60" to "count to 30".
+- **Bulk testing confirms first**: the button turns into "确认测试 N 个模型？" and only sends the N requests if you press it again within five seconds.
 
 ### v0.2.0
 

@@ -17,6 +17,8 @@ type ProbeVerdict =
   | 'region'
   | 'rate_limited'
   | 'exhausted'
+  | 'upstream_error'
+  | 'skipped'
   | 'unknown'
 
 interface ModelRank {
@@ -68,6 +70,8 @@ const VERDICT_LABEL: Record<ProbeVerdict, string> = {
   region: '区域受限',
   rate_limited: '被限流',
   exhausted: '车道额度用尽',
+  upstream_error: '上游临时故障',
+  skipped: '刚测过',
   unknown: '未测出',
 }
 
@@ -78,6 +82,8 @@ const VERDICT_TITLE: Record<ProbeVerdict, string> = {
   region: '模型存在，但你当前网络所在的国家/地区被上游拒绝',
   rate_limited: '临时限流，等一会儿重测多半就通了',
   exhausted: '免费车道拒绝了这台机器的客户端指纹，换模型也一样 —— 要等上游放开，不是等几分钟',
+  upstream_error: '上游网关自己没接住这次请求（5xx），和这个模型本身无关，过一会儿重测即可',
+  skipped: '60 秒内刚测过同一个模型，这次没有再发请求，也没消耗额度',
   unknown: '超时、5xx 或空响应 —— 没有结论，不代表不可用',
 }
 
@@ -105,6 +111,86 @@ async function post<T>(path: string, body: unknown): Promise<T> {
     throw new Error(payload?.message ?? payload?.error ?? `HTTP ${response.status}`)
   }
   return payload.value as T
+}
+
+/**
+ * Read an NDJSON answer, one verdict at a time.
+ *
+ * The bridge streams a line per model instead of one JSON document at the
+ * end: a sweep of nine models can take longer than the host's 300 s request
+ * budget, and a single JSON answer would then be lost completely — the card
+ * would show a dead request instead of the models that did answer. Streaming
+ * also means the first verdict is on screen while the rest are still running.
+ */
+async function postStream(
+  path: string,
+  body: unknown,
+  onResult: (result: ProbeResult) => void,
+): Promise<void> {
+  const response = await fetch(`${PREFIX}${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/x-ndjson' },
+    credentials: 'same-origin',
+    body: JSON.stringify(body),
+  })
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => undefined)) as
+      | { message?: string; error?: string }
+      | undefined
+    throw new Error(payload?.message ?? payload?.error ?? `HTTP ${response.status}`)
+  }
+  if (response.body === null) {
+    const payload = (await response.json().catch(() => undefined)) as
+      | { type?: string; value?: ProbeResult | { ok?: boolean; message?: string } }
+      | undefined
+    if (payload?.type === 'result' && payload.value !== undefined) onResult(payload.value as ProbeResult)
+    if (payload?.type === 'done') {
+      const done = payload.value as { ok?: boolean; message?: string } | undefined
+      if (done?.ok !== true) throw new Error(done?.message ?? '测试失败')
+    }
+    return
+  }
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      let newline = buffer.indexOf('\n')
+      while (newline >= 0) {
+        const line = buffer.slice(0, newline).trim()
+        buffer = buffer.slice(newline + 1)
+        if (line !== '') handleLine(line, onResult)
+        newline = buffer.indexOf('\n')
+      }
+    }
+    buffer += decoder.decode()
+    const tail = buffer.trim()
+    if (tail !== '') handleLine(tail, onResult)
+  } finally {
+    try {
+      await reader.cancel()
+    } catch {
+      // The stream already ended; nothing left to release.
+    }
+  }
+}
+
+function handleLine(line: string, onResult: (result: ProbeResult) => void): void {
+  const payload = JSON.parse(line) as {
+    type?: string
+    value?: ProbeResult | { ok?: boolean; message?: string }
+  }
+  if (payload.type === 'result' && payload.value !== undefined) {
+    onResult(payload.value as ProbeResult)
+    return
+  }
+  if (payload.type === 'done') {
+    const done = payload.value as { ok?: boolean; message?: string } | undefined
+    if (done?.ok !== true) throw new Error(done?.message ?? '测试失败')
+  }
 }
 
 async function getStatus(): Promise<StatusValue> {
@@ -202,6 +288,8 @@ const CSS = `
 .fmo-v-region{color:var(--dsw-alias-state-error-primary,#ff6b6b);}
 .fmo-v-rate_limited{color:var(--dsw-alias-state-warn-label,#e0a030);}
 .fmo-v-exhausted{color:var(--dsw-alias-state-error-primary,#ff6b6b);}
+.fmo-v-upstream_error{color:var(--dsw-alias-state-warn-label,#e0a030);}
+.fmo-v-skipped{color:var(--dsw-alias-label-tertiary,#999);}
 .fmo-v-unknown{color:var(--dsw-alias-label-tertiary,#999);}
 .fmo-empty{padding:18px 12px;text-align:center;font-size:12px;color:var(--dsw-alias-label-tertiary,#888);}
 .fmo-sort{display:flex;align-items:center;gap:6px;flex-wrap:wrap;}
@@ -237,12 +325,20 @@ export function FreemodelsCard(): JSX.Element {
   const [progress, setProgress] = useState('')
   const [error, setError] = useState('')
   const [note, setNote] = useState('')
+  const [confirmProbe, setConfirmProbe] = useState(false)
   const mounted = useRef(true)
+  // The background enrichment polls and the confirmation countdown are
+  // timers this card owns: they must not outlive it, or they would keep
+  // fetching a status nobody is showing.
+  const timers = useRef<number[]>([])
 
   useEffect(() => {
     mounted.current = true
+    const owned = timers.current
     return () => {
       mounted.current = false
+      for (const timer of owned) window.clearTimeout(timer)
+      owned.length = 0
     }
   }, [])
 
@@ -271,9 +367,13 @@ export function FreemodelsCard(): JSX.Element {
     setError('')
     setNote('')
     try {
+      // `quick` answers with the id list within a second; the 5.8 MB metadata
+      // document (6–116 s on this connection) is filled in by the host in the
+      // background, so the card is usable immediately instead of staring at a
+      // spinner for two minutes.
       const value = await post<{ models: ModelRow[]; selected: string[]; lastRefresh: string; warning?: string }>(
         '/refresh',
-        {},
+        { mode: 'quick' },
       )
       if (!mounted.current) return
       setStatus((previous) => ({
@@ -284,13 +384,22 @@ export function FreemodelsCard(): JSX.Element {
         loaded: previous?.loaded ?? true,
       }))
       setNote(value.warning ?? `已刷新，共 ${value.models.length} 个模型`)
+      // The enrichment lands later; pick it up without asking the user to
+      // press refresh again.
+      for (const delay of [15_000, 60_000, 150_000]) {
+        timers.current.push(
+          window.setTimeout(() => {
+            if (mounted.current) void load()
+          }, delay),
+        )
+      }
     } catch (cause) {
       if (!mounted.current) return
       setError(`刷新失败：${cause instanceof Error ? cause.message : String(cause)}`)
     } finally {
       if (mounted.current) setBusy('idle')
     }
-  }, [])
+  }, [load])
 
   const toggle = useCallback(
     async (id: string, on: boolean) => {
@@ -317,12 +426,9 @@ export function FreemodelsCard(): JSX.Element {
     setProgress(`正在测试 ${id}…`)
     setError('')
     try {
-      const value = await post<{ results: ProbeResult[] }>('/probe', { scope: 'one', id })
-      if (!mounted.current) return
-      setVerdicts((previous) => {
-        const next = { ...previous }
-        for (const result of value.results) next[result.id] = result
-        return next
+      await postStream('/probe', { scope: 'one', id }, (result) => {
+        if (!mounted.current) return
+        setVerdicts((previous) => ({ ...previous, [result.id]: result }))
       })
     } catch (cause) {
       if (!mounted.current) return
@@ -342,22 +448,25 @@ export function FreemodelsCard(): JSX.Element {
     setError('')
     setVerdicts({})
     setProgress(`正在测试 ${ids.length} 个已勾选模型…`)
+    const seen: ProbeResult[] = []
     try {
-      const value = await post<{ results: ProbeResult[] }>('/probe', { scope: 'selected' })
+      await postStream('/probe', { scope: 'selected' }, (result) => {
+        if (!mounted.current) return
+        seen.push(result)
+        setVerdicts((previous) => ({ ...previous, [result.id]: result }))
+        setProgress(`正在测试 ${ids.length} 个已勾选模型…（已完成 ${seen.length}）`)
+      })
       if (!mounted.current) return
-      const next: Record<string, ProbeResult> = {}
-      for (const result of value.results) next[result.id] = result
-      setVerdicts(next)
-      const usable = value.results.filter((result) => result.verdict === 'available').length
-      const blocked = value.results.find(
+      const usable = seen.filter((result) => result.verdict === 'available').length
+      const blocked = seen.find(
         (result) => result.verdict === 'paid' || result.verdict === 'exhausted',
       )
       // The host stops the sweep on a verdict that cannot vary by model, so a
       // short result list is expected — say why instead of showing a wrong total.
       setNote(
         blocked === undefined
-          ? `测试完成：${usable}/${value.results.length} 个可用`
-          : `测试到「${VERDICT_LABEL[blocked.verdict]}」就停了（后 ${ids.length - value.results.length} 个不会再变），已测 ${value.results.length} 个，${usable} 个可用`,
+          ? `测试完成：${usable}/${seen.length} 个可用`
+          : `测试到「${VERDICT_LABEL[blocked.verdict]}」就停了（后 ${ids.length - seen.length} 个不会再变），已测 ${seen.length} 个，${usable} 个可用`,
       )
     } catch (cause) {
       if (!mounted.current) return
@@ -417,11 +526,29 @@ export function FreemodelsCard(): JSX.Element {
         </button>
         <button
           type="button"
-          className="fmo-btn fmo-btn-primary"
-          onClick={() => void probeSelected()}
+          className={confirmProbe ? 'fmo-btn fmo-btn-primary' : 'fmo-btn'}
+          onClick={() => {
+            // Two-step: one click asks, the second one (within five seconds)
+            // spends the quota. A sweep of N models is N real requests
+            // against a shared free bucket, and the user was rate-limited
+            // into an IP ban by probing too much — a stray click must not
+            // start that on its own.
+            if (!confirmProbe) {
+              setConfirmProbe(true)
+              setNote(`确认测试 ${selected.size} 个模型？会发 ${selected.size} 次真实请求，消耗一点免费额度。`)
+              timers.current.push(
+                window.setTimeout(() => {
+                  if (mounted.current) setConfirmProbe(false)
+                }, 5000),
+              )
+              return
+            }
+            setConfirmProbe(false)
+            void probeSelected()
+          }}
           disabled={!idle || selected.size === 0}
         >
-          测试已勾选（{selected.size}）
+          {confirmProbe ? `确认测试 ${selected.size} 个模型？` : `测试已勾选（${selected.size}）`}
         </button>
         {progress === '' ? null : <span className="fmo-note">{progress}</span>}
       </div>
@@ -551,7 +678,17 @@ export function FreemodelsCard(): JSX.Element {
 
       <div className="fmo-note">
         {(
-          ['available', 'rate_limited', 'exhausted', 'paid', 'region', 'unavailable', 'unknown'] as ProbeVerdict[]
+          [
+            'available',
+            'rate_limited',
+            'exhausted',
+            'paid',
+            'region',
+            'unavailable',
+            'upstream_error',
+            'skipped',
+            'unknown',
+          ] as ProbeVerdict[]
         ).map((verdict) => (
           <span key={verdict} className={`fmo-verdict fmo-v-${verdict}`} title={VERDICT_TITLE[verdict]} style={{ marginRight: 6 }}>
             {VERDICT_LABEL[verdict]}

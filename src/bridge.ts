@@ -12,6 +12,7 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { refreshCatalog, type ModelMeta } from './catalog.ts'
+import { describeNetworkError } from './net-errors.ts'
 import { probeModel, type ProbeResult } from './probe.ts'
 import type { ModelStore } from './store.ts'
 
@@ -19,12 +20,27 @@ export const BRIDGE_PREFIX = '/plugins/dsh-freemodels-opencode'
 
 const MAX_BODY_BYTES = 16 * 1024
 
+/**
+ * How long one model stays "just tested".
+ *
+ * Every probe is a real request against a shared free bucket on the lane. The
+ * user was rate-limited into an IP ban by probing too much, so the same model
+ * is not tested twice inside this window: the second attempt is answered from
+ * memory instead of spending quota for a result that cannot have changed.
+ */
+export const PROBE_THROTTLE_MS = 60_000
+
 export interface BridgeDeps {
   store: ModelStore
   /** Re-broadcast the model list to the harness after the ticked set changed. */
   publish: () => void
   fetchImpl?: typeof fetch
   baseUrl?: string
+  /**
+   * Per-model probe memory. One bridge instance keeps its own; a host that
+   * mounts the plugin twice must not share answers between the two.
+   */
+  throttle?: ProbeThrottle
 }
 
 function writeJson(res: ServerResponse, status: number, body: unknown): void {
@@ -110,6 +126,40 @@ function summary(models: ModelMeta[]): Array<Record<string, unknown>> {
 const SHARED_WINDOW_MS = 5 * 60 * 1000
 
 /**
+ * Per-model memory of the last probe.
+ *
+ * Scoped to one bridge instance — a property of this session, not something
+ * that should survive a restart — so a second bridge in the same process
+ * (another host, a test) never inherits another one's answers.
+ */
+export interface ProbeThrottle {
+  /** Is this model "just tested"? */
+  isThrottled(id: string, now?: number): boolean
+  /** Remember that this model was just tested. */
+  mark(id: string, now?: number): void
+}
+
+export function createProbeThrottle(windowMs: number = PROBE_THROTTLE_MS): ProbeThrottle {
+  const lastProbed = new Map<string, number>()
+  return {
+    isThrottled(id, now = Date.now()) {
+      const at = lastProbed.get(id)
+      return at !== undefined && now - at < windowMs
+    },
+    mark(id, now = Date.now()) {
+      lastProbed.set(id, now)
+      // The map only ever holds ids the user looks at; trimming it keeps a long
+      // session from growing it without bound.
+      if (lastProbed.size > 64) {
+        for (const [key, at] of lastProbed) {
+          if (now - at >= windowMs) lastProbed.delete(key)
+        }
+      }
+    },
+  }
+}
+
+/**
  * Serial on purpose: a burst of parallel probes manufactures the very rate
  * limits it reports.
  *
@@ -119,10 +169,20 @@ const SHARED_WINDOW_MS = 5 * 60 * 1000
  * `retry-after` (one shared bucket is spent). Everything else keeps probing —
  * a short 429 is genuinely per-model information worth collecting.
  */
-async function sweep(deps: BridgeDeps, ids: string[], timeoutMs?: number): Promise<ProbeResult[]> {
+async function sweep(
+  throttle: ProbeThrottle,
+  deps: BridgeDeps,
+  ids: string[],
+  timeoutMs?: number,
+): Promise<ProbeResult[]> {
   const results: ProbeResult[] = []
   for (const id of ids) {
+    if (throttle.isThrottled(id)) {
+      results.push({ id, verdict: 'skipped', detail: '刚测过（60 秒内不重复测试）' })
+      continue
+    }
     const result = await probeModel(id, { fetchImpl: deps.fetchImpl, baseUrl: deps.baseUrl, timeoutMs })
+    throttle.mark(id)
     results.push(result)
     if (result.verdict === 'paid' || result.verdict === 'exhausted') break
     if (result.verdict === 'rate_limited' && (result.retryAfterMs ?? 0) > SHARED_WINDOW_MS) break
@@ -132,6 +192,10 @@ async function sweep(deps: BridgeDeps, ids: string[], timeoutMs?: number): Promi
 
 export function makeHandlers(deps: BridgeDeps) {
   const { store } = deps
+  // One throttle per bridge: "just tested" belongs to this plugin instance,
+  // not to the process. A host that mounts the plugin twice gets two
+  // independent memories instead of one silently sharing the other's answers.
+  const throttle = deps.throttle ?? createProbeThrottle()
 
   async function status(): Promise<Record<string, unknown>> {
     const state = store.state
@@ -147,7 +211,50 @@ export function makeHandlers(deps: BridgeDeps) {
     }
   }
 
-  async function refresh(): Promise<Record<string, unknown>> {
+  /**
+   * Fill in the models.dev metadata in the background.
+   *
+   * The quick refresh answers with the id list within a second; the 5.8 MB
+   * metadata document then takes 6–116 s on this connection. Doing it in the
+   * background means the card is usable immediately and the windows and effort
+   * ladders arrive on their own a minute later, instead of the user staring at
+   * a spinner for two minutes to learn which models exist.
+   *
+   * One fill runs at a time: a second click must not start a second 5.8 MB
+   * download of the same document.
+   */
+  let metadataFill: Promise<void> | undefined
+  function fillMetadataInBackground(): void {
+    if (metadataFill !== undefined) return
+    metadataFill = (async () => {
+      try {
+        const result = await refreshCatalog({
+          fetchImpl: deps.fetchImpl,
+          baseUrl: deps.baseUrl,
+          previous: store.state.models,
+        })
+        await store.replaceCatalog(result.models, result.fetchedAt)
+        deps.publish()
+      } catch {
+        // The quick path already published a usable catalogue; a failed
+        // enrichment must not replace it with an error, and the cached
+        // metadata is still in place.
+      } finally {
+        metadataFill = undefined
+      }
+    })()
+  }
+
+  /**
+   * Refresh the catalogue.
+   *
+   * `mode: 'quick'` returns the id list only and starts the metadata fill in
+   * the background; the default waits for everything, because a caller that
+   * wants the final windows and ladders should not get a half-described
+   * catalogue without asking for it.
+   */
+  async function refresh(body: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+    const quick = body.mode === 'quick'
     try {
       const result = await refreshCatalog({
         fetchImpl: deps.fetchImpl,
@@ -155,9 +262,11 @@ export function makeHandlers(deps: BridgeDeps) {
         // models.dev times out often; without this a failed fetch would wipe
         // every reasoning ladder and context window in the cache.
         previous: store.state.models,
+        skipMetadata: quick,
       })
       await store.replaceCatalog(result.models, result.fetchedAt)
       deps.publish()
+      if (quick) fillMetadataInBackground()
       return {
         ok: true,
         value: {
@@ -168,7 +277,7 @@ export function makeHandlers(deps: BridgeDeps) {
         },
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
+      const message = describeNetworkError(error)
       await store.recordError(message)
       return { ok: false, code: 'refresh-failed', message }
     }
@@ -191,24 +300,76 @@ export function makeHandlers(deps: BridgeDeps) {
       if (typeof body.id !== 'string' || body.id === '') {
         return { ok: false, code: 'settings-rejected', message: "scope 'one' requires an id" }
       }
-      return {
-        ok: true,
-        value: { results: [await probeModel(body.id, { fetchImpl: deps.fetchImpl, baseUrl: deps.baseUrl, timeoutMs })] },
+      if (throttle.isThrottled(body.id)) {
+        return { ok: true, value: { results: [{ id: body.id, verdict: 'skipped', detail: '刚测过（60 秒内不重复测试）' }] } }
       }
+      const result = await probeModel(body.id, { fetchImpl: deps.fetchImpl, baseUrl: deps.baseUrl, timeoutMs })
+      throttle.mark(body.id)
+      return { ok: true, value: { results: [result] } }
     }
     if (scope === 'selected') {
       const ids = store.state.selected
       if (ids.length === 0) return { ok: true, value: { results: [] } }
-      return { ok: true, value: { results: await sweep(deps, ids, timeoutMs) } }
+      return { ok: true, value: { results: await sweep(throttle, deps, ids, timeoutMs) } }
     }
     if (scope === 'all') {
       const ids = store.state.models.map((model) => model.id)
-      return { ok: true, value: { results: await sweep(deps, ids, timeoutMs) } }
+      return { ok: true, value: { results: await sweep(throttle, deps, ids, timeoutMs) } }
     }
     return { ok: false, code: 'settings-rejected', message: "probe scope must be 'one', 'selected' or 'all'" }
   }
 
-  return { status, refresh, select, probe }
+  /**
+   * Probe, reporting every model as soon as it is measured.
+   *
+   * The plain `probe` waits for the whole sweep, and a sweep of nine models
+   * can take minutes: the host's HTTP server gives a request 300 s, and a
+   * sweep that gets cut off halfway returns nothing at all — the user sees a
+   * failed request and no results, which is exactly the "测不出来" the plugin
+   * was blamed for. Streaming each result as it lands keeps the connection
+   * alive and shows the answer for the models that are already done.
+   */
+  async function probeStream(
+    body: Record<string, unknown>,
+    emit: (result: ProbeResult) => void,
+  ): Promise<{ ok: boolean; message?: string }> {
+    const scope = body.scope
+    const timeoutMs = typeof body.timeoutMs === 'number' && body.timeoutMs > 0 ? body.timeoutMs : undefined
+    if (scope === 'one') {
+      if (typeof body.id !== 'string' || body.id === '') {
+        return { ok: false, message: "scope 'one' requires an id" }
+      }
+      if (throttle.isThrottled(body.id)) {
+        emit({ id: body.id, verdict: 'skipped', detail: '刚测过（60 秒内不重复测试）' })
+        return { ok: true }
+      }
+      const result = await probeModel(body.id, { fetchImpl: deps.fetchImpl, baseUrl: deps.baseUrl, timeoutMs })
+      throttle.mark(body.id)
+      emit(result)
+      return { ok: true }
+    }
+    if (scope === 'selected' || scope === 'all') {
+      const ids = scope === 'selected' ? store.state.selected : store.state.models.map((model) => model.id)
+      for (const id of ids) {
+        if (throttle.isThrottled(id)) {
+          emit({ id, verdict: 'skipped', detail: '刚测过（60 秒内不重复测试）' })
+          continue
+        }
+        const result = await probeModel(id, { fetchImpl: deps.fetchImpl, baseUrl: deps.baseUrl, timeoutMs })
+        throttle.mark(id)
+        emit(result)
+        // The same stopping rule as the plain sweep: a verdict that cannot vary
+        // by model ends the run, and the remaining models are reported as not
+        // tested rather than silently missing.
+        if (result.verdict === 'paid' || result.verdict === 'exhausted') break
+        if (result.verdict === 'rate_limited' && (result.retryAfterMs ?? 0) > SHARED_WINDOW_MS) break
+      }
+      return { ok: true }
+    }
+    return { ok: false, message: "probe scope must be 'one', 'selected' or 'all'" }
+  }
+
+  return { status, refresh, select, probe, probeStream }
 }
 
 export interface BridgeRoute {
@@ -246,7 +407,12 @@ export function makeRoutes(deps: BridgeDeps): BridgeRoute[] {
       path: `${BRIDGE_PREFIX}/refresh`,
       handler: async (request, response) => {
         if (!guard(request, response, 'POST')) return
-        writeJson(response, 200, await handlers.refresh())
+        const body = await readBody(request)
+        if (body === undefined) {
+          writeJson(response, 400, { ok: false, code: 'settings-rejected', message: 'unreadable JSON body' })
+          return
+        }
+        writeJson(response, 200, await handlers.refresh(body))
       },
     },
     {
@@ -272,7 +438,26 @@ export function makeRoutes(deps: BridgeDeps): BridgeRoute[] {
           writeJson(response, 400, { ok: false, code: 'settings-rejected', message: 'unreadable JSON body' })
           return
         }
-        writeJson(response, 200, await handlers.probe(body))
+        // NDJSON, one line per model, so the card can show a verdict the moment
+        // that model is measured. A sweep of nine models can outlast the
+        // host's 300 s request budget, and a plain JSON answer would then be
+        // lost entirely — the user sees a dead request and no results at all.
+        response.statusCode = 200
+        response.setHeader('content-type', 'application/x-ndjson; charset=utf-8')
+        response.setHeader('cache-control', 'no-store')
+        response.setHeader('referrer-policy', 'no-referrer')
+        const write = (payload: unknown): void => {
+          response.write(`${JSON.stringify(payload)}\n`)
+        }
+        try {
+          const outcome = await handlers.probeStream(body, (result) => {
+            write({ type: 'result', value: result })
+          })
+          write({ type: 'done', value: { ok: outcome.ok, message: outcome.message } })
+        } catch (error) {
+          write({ type: 'done', value: { ok: false, message: describeNetworkError(error) } })
+        }
+        response.end()
       },
     },
   ]

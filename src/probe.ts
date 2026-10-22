@@ -11,6 +11,7 @@
  * A verdict is one observation at one moment. Rate limits expire, upstreams
  * come back — nothing here is persisted as a permanent property of a model.
  */
+import { describeNetworkError } from './net-errors.ts'
 import { disguiseHeaders, probeRequestIDs } from './zen-ids.ts'
 
 export type ProbeVerdict =
@@ -30,8 +31,26 @@ export type ProbeVerdict =
    * because the lane wants OpenCode's own client rather than our headers.
    */
   | 'exhausted'
-  /** Reached, but nothing conclusive came back (timeout, 5xx, empty body). */
+  /**
+   * The upstream answered, but with a temporary server-side failure
+   * ("Upstream request failed: Endpoint is unavailable.").
+   *
+   * This is the one verdict that is explicitly *retryable*: the same model
+   * answered normally a minute later. It used to be reported as `unknown`
+   * ("未测出"), which is a statement about the measurement rather than about
+   * the model, and made a working model look broken.
+   */
+  | 'upstream_error'
+  /** Reached, but nothing conclusive came back (timeout, empty body). */
   | 'unknown'
+  /**
+   * The probe was not run at all: the same model was tested moments ago.
+   *
+   * Every probe is a real request against a shared free bucket, so re-testing
+   * the same model a second later buys nothing and spends quota the user
+   * needed. The bridge answers with this verdict instead of sending it.
+   */
+  | 'skipped'
 
 export interface ProbeResult {
   id: string
@@ -48,8 +67,14 @@ export interface ProbeResult {
  * 63 s end-to-end, and a normal one 2–15 s. Twenty seconds cut real answers off
  * and reported them as "未测出", which reads like a broken model when it is a
  * slow one.
+ *
+ * The budget covers the *first useful content*, not the whole answer: the
+ * probe stops reading as soon as the model starts talking (see
+ * {@link probeModel}), so a 90 s budget still costs seconds on a healthy model.
+ * What it buys is that a slow model — `mimo-v2.6-flash-free` needed 29.8 s
+ * before its first token — is measured instead of being declared unmeasurable.
  */
-export const PROBE_TIMEOUT_MS = 30_000
+export const PROBE_TIMEOUT_MS = 90_000
 
 const GATE_TOOLS = [
   {
@@ -78,13 +103,19 @@ export function probeBody(model: string, maxTokens = REALISTIC_MAX_TOKENS): stri
  * A ping that asks for a handful of tokens proves almost nothing: the lane's
  * window can have just enough budget left for `ping` and still 429 the first
  * real turn, which is exactly the false "available" this plugin shipped with.
- * The probe therefore asks for a few hundred tokens of real output — big enough
- * that a nearly-spent window fails here instead of in the user's conversation,
- * small enough that a healthy window barely notices.
+ * The probe therefore asks for a real answer — big enough that a nearly-spent
+ * window fails here instead of in the user's conversation, small enough that a
+ * healthy window barely notices.
+ *
+ * The size was cut from 512 to 96 tokens (and the list from 1..60 to 1..30)
+ * after measuring what the lane charges for: every probe is a real request
+ * against a shared free bucket, and the user was rate-limited into an IP ban
+ * by probing too much. Thirty integers are still a real answer, and the
+ * classification only needs to see that content is flowing.
  */
 const REALISTIC_PROMPT =
-  'Reply with the integers from 1 to 60, separated by single spaces, and nothing else. Do not explain.'
-export const REALISTIC_MAX_TOKENS = 512
+  'Reply with the integers from 1 to 30, separated by single spaces, and nothing else. Do not explain.'
+export const REALISTIC_MAX_TOKENS = 96
 
 /**
  * Parse `retry-after` into milliseconds. The header is either a delta in seconds
@@ -176,6 +207,15 @@ export function classify(status: number, raw: string): { verdict: ProbeVerdict; 
   if (lower.includes('modelprotocolunsupported') || lower.includes('does not support this protocol')) {
     return { verdict: 'unavailable', detail: message === '' ? '上游不支持该模型使用的协议' : message }
   }
+  // A temporary server-side failure is not a verdict about the model: the same
+  // id answered normally a minute later. It gets its own label so the user is
+  // told "retry" instead of being shown "未测出", which reads like the model
+  // is broken. It sits below the checks above on purpose — "Upstream request
+  // failed: Model is unavailable." also contains this phrase, and that one is
+  // a definitive answer about the model, not a hiccup.
+  if (lower.includes('upstream request failed') || lower.includes('endpoint is unavailable')) {
+    return { verdict: 'upstream_error', detail: message === '' ? '上游临时故障，等一会儿重试' : message }
+  }
   if (status === 400 || status === 422) {
     return { verdict: 'unknown', detail: message === '' ? `HTTP ${status}` : message }
   }
@@ -183,6 +223,73 @@ export function classify(status: number, raw: string): { verdict: ProbeVerdict; 
     return { verdict: 'unknown', detail: message === '' ? `HTTP ${status}：上游错误` : message }
   }
   return { verdict: 'unknown', detail: message === '' ? `HTTP ${status}` : message }
+}
+
+/**
+ * Does this chunk carry real content?
+ *
+ * The lane answers in SSE frames; a frame with a non-empty `content`,
+ * `reasoning_content` or `text` is the model talking. A frame that only
+ * carries an empty delta or a `finish_reason` is the model saying goodbye,
+ * and a bare `data: [DONE]` is the stream closing.
+ *
+ * The value must be non-empty on purpose: OpenAI-style streams open with
+ * `{"delta":{"role":"assistant","content":""}}`, and treating that as content
+ * would end the probe before the model said anything.
+ */
+const CONTENT_PATTERN = /"(?:content|reasoning_content|reasoning|text)"\s*:\s*"[^"]/u
+const TOOL_CALL_PATTERN = /"tool_calls"\s*:\s*\[/u
+
+function hasContent(chunk: string): boolean {
+  if (chunk.length === 0) return false
+  return CONTENT_PATTERN.test(chunk) || TOOL_CALL_PATTERN.test(chunk)
+}
+
+/**
+ * Read the response until the model says something, then stop.
+ *
+ * The old probe called `response.text()` first, which waits for the *whole*
+ * stream to finish. On this lane a healthy answer can be 135 KB of reasoning
+ * frames, and a slow model needed 29.8 s before its first token — so the read
+ * either blew the timeout (reported as "未测出") or burned the whole budget
+ * for an answer whose first frame arrived in 1.6 s. Reading the stream and
+ * stopping at the first real content answers the only question the probe
+ * asks — "is this model reachable right now" — in the time the model needed to
+ * start talking.
+ */
+async function readUntilContent(response: Response): Promise<string> {
+  const body = response.body
+  if (body === null) return await response.text()
+  const reader = body.getReader()
+  const decoder = new TextDecoder()
+  let text = ''
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      text += decoder.decode(value, { stream: true })
+      if (hasContent(text)) {
+        // Stop the upstream as well: the answer is already known, and the rest
+        // of the stream is quota the user would pay for and nobody reads.
+        await reader.cancel().catch(() => undefined)
+        return text
+      }
+    }
+    text += decoder.decode()
+    return text
+  } catch (error) {
+    // A stream that breaks halfway is not a verdict: the caller still has the
+    // bytes that did arrive, and those may already say "available".
+    text += decoder.decode()
+    if (text !== '') return text
+    throw error
+  } finally {
+    try {
+      reader.releaseLock()
+    } catch {
+      // Already released.
+    }
+  }
 }
 
 /** Probe one model. Never throws: every failure becomes a verdict. */
@@ -210,7 +317,7 @@ export async function probeModel(
       body: probeBody(id, maxTokens),
       signal: controller.signal,
     })
-    const text = await response.text()
+    const text = await readUntilContent(response)
     const detail = classify(response.status, text)
     if (response.ok) {
       return { id, ...detail, ms: Date.now() - started }
@@ -228,8 +335,8 @@ export async function probeModel(
       id,
       verdict: 'unknown',
       detail: aborted
-        ? `${Math.round(timeoutMs / 1000)}s 内没有响应`
-        : `请求失败：${error instanceof Error ? error.message : String(error)}`,
+        ? `${timeoutMs < 1000 ? `${timeoutMs}ms` : `${Math.round(timeoutMs / 1000)}s`} 内没有等到有效内容`
+        : `请求失败：${describeNetworkError(error)}`,
       ms: Date.now() - started,
     }
   } finally {

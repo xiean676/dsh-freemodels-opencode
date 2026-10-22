@@ -58,6 +58,12 @@ const GRADE_BANDS: ReadonlyArray<readonly [Grade, number]> = [
  * reviewable later instead of looking like magic.
  */
 const MANUAL_RANKS = new Map<string, { score: number; reason: string }>([
+  // `space-bunny-free` and `longcat-2.5-preview-free` are no longer in the
+  // upstream id list (checked 2026-10-22: 86 ids, neither present). The
+  // entries are kept on purpose: the table is an editorial order of models we
+  // have used, and if the gateway puts them back they belong in their old
+  // place instead of being re-guessed by the keyword fallback. Until then they
+  // simply never appear in the catalogue.
   [
     'space-bunny-free',
     {
@@ -80,6 +86,13 @@ const MANUAL_RANKS = new Map<string, { score: number; reason: string }>([
     },
   ],
   [
+    'minimax-m3.1-flash-free',
+    {
+      score: 87,
+      reason: 'MiniMax M3.1 Flash：1M 上下文 + 512K 输出，档位最全（low→max），支持视觉输入；能力面比下面几个都宽，但新上线不久、稳定性还没被长会话验证过，所以压一档放在这里。',
+    },
+  ],
+  [
     'nemotron-3.5-super-vl-free',
     {
       score: 85,
@@ -97,7 +110,14 @@ const MANUAL_RANKS = new Map<string, { score: number; reason: string }>([
     'longcat-2.5-preview-free',
     {
       score: 74,
-      reason: '1M 上下文 + 视觉，但仍是 preview，预览版的行为稳定性按打折算。',
+      reason: '1M 上下文 + 视觉，但仍是 preview，预览版的行为稳定性按打折算。（上游 2026-10 已把这个 id 从清单里撤下，暂时不会出现在列表中。）',
+    },
+  ],
+  [
+    'flint-40b-free',
+    {
+      score: 71,
+      reason: '40B 规模、262144 上下文、档位齐全（low→max）；上游没公布家族和视觉信息，实际表现只能靠实测，放 B 段下沿。',
     },
   ],
   [
@@ -130,8 +150,13 @@ const MANUAL_RANKS = new Map<string, { score: number; reason: string }>([
 /**
  * Ceiling for a keyword estimate, set below the lowest manual rating (64) so an
  * unknown id can never displace a rating someone wrote on purpose.
+ *
+ * The gap is deliberately one point wide: raise the ceiling past 64 and an
+ * unrated model could outrank the weakest written rating, which would break
+ * the one rule this file exists to keep. Lower the lowest manual rating below
+ * this number and the same thing happens from the other side.
  */
-export const HEURISTIC_CEILING = 61
+export const HEURISTIC_CEILING = 63
 
 /**
  * Keyword weights for the fallback. Ordered: the first hit per group wins, so
@@ -150,6 +175,18 @@ const TIER_WORDS: ReadonlyArray<readonly [string, number]> = [
   ['nano', -8],
   ['tiny', -8],
 ]
+
+/**
+ * Split an id into the words a human would read as separate.
+ *
+ * Substring matching is wrong here: `minimax-m3.1-flash-free` contains "max",
+ * so the old `id.includes('max')` rule gave a *new* model a +4 tier bonus and
+ * cancelled the "flash" discount that the same id deserved. A tier word is a
+ * word, not a letter run, so it is matched against whole tokens.
+ */
+function tokensOf(id: string): Set<string> {
+  return new Set(id.split(/[^a-z0-9]+/u).filter((token) => token !== ''))
+}
 
 /** Baseline for an id with no tier word and no version: "unknown, not bad". */
 const HEURISTIC_BASE = 60
@@ -183,13 +220,14 @@ function versionOf(id: string): { major: number; minor: number } {
 export function heuristicRank(model: RankInput): ModelRank {
   const id = model.id.toLowerCase()
   const { major, minor } = versionOf(id)
+  const tokens = tokensOf(id)
   let score = HEURISTIC_BASE
   if (major > 0) {
     score += 3 * clamp(major - 1, 0, 5)
     score += 2 * clamp(minor, 0, 4)
   }
   for (const [word, delta] of TIER_WORDS) {
-    if (id.includes(word)) {
+    if (tokens.has(word)) {
       score += delta
       break
     }
